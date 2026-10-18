@@ -316,7 +316,10 @@ port-vessel-matching/
   - 대회 데이터 재배포 금지 규칙
   - 제출 폴더 `resources.pkl`: train 정답 기반 조회표 포함
   - OOF CSV: train 행 그대로 포함
+<<<<<<< HEAD
   - 임베딩 가중치: 용량이 큼 (각자 `tools/download_models.py`로 받기)
 - 저장소는 **private** 권장
 - LightGBM 모델 저장 방식: 문자열 변환 후 Python으로 저장·로드 (`model_to_string` / `Booster(model_str=...)`)
   - LightGBM C++ 저장 함수가 Windows 한글 경로를 열지 못하기 때문
+=======
+>>>>>>> 4d8640b18f1f0e74a8a076c1f432fb769a2b83dc
