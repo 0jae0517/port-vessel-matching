@@ -34,6 +34,10 @@ TOP_SKELETON = 30
 TOP_COMBINED = 30
 TOP_TONNAGE = 10
 TONNAGE_BONUS = 25.0
+TOP_EMB = 30
+MAX_EMB = 2
+# 임베딩 코사인(0~1)을 이름 ratio(0~100)와 섞는 비율. 이름만 top-1 분석에서 e5-small 1.5 + LaBSE 0.5 가 최고
+EMB_FUSE = (150.0, 50.0)
 CHUNK = 200
 
 
@@ -377,7 +381,8 @@ def learned_word_variants(word: str, syl_map: dict) -> list[tuple[str, float]]:
 # 한글 선박명의 상당수는 영어 단어를 소리 나는 대로 적은 것이다 (에이스 → ACE, 갤럭시 → GALAXY).
 # 카탈로그(공식 데이터)의 영문 단어장에서 표기·자음 골격이 가장 가까운 실제 단어를 후보로 쓴다.
 VOCAB_TOP = 3
-# 단어장 표기는 틀리면 다른 배 이름과 정확히 일치해 CV를 떨어뜨려(v8: 0.9951 < v5: 0.9986) 기본은 끈다
+# 단어장 표기는 틀리면 다른 배 이름과 정확히 일치해 CV를 떨어뜨려(v8: 0.9951 < v5: 0.9986) 기본은 끈다.
+# 켜려면 resources["use_vocab"] = True (train.py --vocab 이 학습·제출 모두에 저장한다)
 USE_VOCAB = False
 
 
@@ -511,6 +516,27 @@ class CatalogIndex:
         self.sorted_gt_idx = valid[order]
         self.sorted_gt = self.gt[self.sorted_gt_idx]
 
+    # ------------------------------------------------------------ 다국어 임베딩 (선택, 최대 MAX_EMB개)
+    embs: list[dict] = []
+
+    @property
+    def cat_emb(self) -> np.ndarray | None:
+        return self.embs[0]["cat"] if self.embs else None
+
+    def attach_embedder(self, embedder, cat_emb: np.ndarray | None = None) -> None:
+        """카탈로그 이름 임베딩을 준비한다. 카탈로그는 test와 무관하게 고정 배치로 한 번만 계산한다."""
+        if cat_emb is None:
+            cat_emb = embedder.encode(self.catalog["vessel_name"].astype(str).tolist())
+        self.embs = [*self.embs, {"embedder": embedder, "cat": cat_emb, "cache": {}}]
+
+    def query_emb(self, names: list[str], k: int = 0) -> np.ndarray:
+        """k번째 임베딩의 쿼리 이름 임베딩. 평가 행 독립을 위해 이름마다 단독(batch 1)으로 계산하고 캐시한다."""
+        emb = self.embs[k]
+        for name in dict.fromkeys(names):
+            if name not in emb["cache"]:
+                emb["cache"][name] = emb["embedder"].encode([name], batch_size=1)[0]
+        return np.stack([emb["cache"][name] for name in names])
+
     def nearest_gt(self, value: float | None, count: int) -> list[int]:
         if value is None:
             return []
@@ -583,6 +609,7 @@ def prepare_query(row: dict, res: dict) -> dict:
     rom_compact = "".join(romanized)
     return {
         "hangul": hangul,
+        "raw": name if isinstance(name, str) else "",
         "whole_hit": whole is not None,
         "dict_cov": covered / len(hangul_words) if hangul_words else 1.0,
         "clean": " ".join(translated),
@@ -591,7 +618,7 @@ def prepare_query(row: dict, res: dict) -> dict:
         "variants": var_compacts,
         "learned": ([trans_compact] if whole is not None else learned_variants(toks, res)) if hangul else [],
         "vocab_forms": (learned_variants(toks, res, use_vocab=True)[:3]
-                        if USE_VOCAB and hangul and whole is None else []),
+                        if res.get("use_vocab", USE_VOCAB) and hangul and whole is None else []),
         "skel_rom": skeleton(rom_compact, english=not hangul),
         "skel_trans": skeleton(trans_compact, english=not hangul),
         "first": translated[0] if translated else "",
@@ -618,6 +645,8 @@ FEATURE_NAMES = (
     "s_vocab_ratio", "s_vocab_jw", "rel_vocab",
     "num_q_only", "num_c_only",
     "s_alpha_ratio", "rel_alpha",
+    "s_emb", "rel_emb", "rank_emb",
+    "s_emb2", "rel_emb2", "rank_emb2",
 )
 
 
@@ -679,8 +708,28 @@ def candidates_and_features(
             top_var.append(_topk(m_vocab, TOP_COMPACT))
             top_var.append(_topk(m_vocab + bonus[hangul_rows], TOP_COMBINED))
 
+        # 다국어 임베딩 (원문 한글 ↔ 영문 카탈로그명 의미 유사도): 단독 / 이름·톤수와 결합
+        # 기본은 한글 쿼리에만 적용: 영문 쿼리에서는 임베딩이 철자보다 '뜻'이 비슷한 다른 배를 끌어올림
+        # (v14 Public: 한글 오답 2→1, 비한글 오답 5→8)
+        emb_rows_idx = hangul_rows if res.get("emb_hangul_only", True) else list(range(len(part)))
+        emb_pos = {r: j for j, r in enumerate(emb_rows_idx)}
+        m_embs: list[np.ndarray] = []
+        top_emb: list[np.ndarray] = []
+        if index.embs and emb_rows_idx:
+            raws = [part[i]["raw"] for i in emb_rows_idx]
+            fused = m_compact[emb_rows_idx] + bonus[emb_rows_idx]
+            for k, emb in enumerate(index.embs[:MAX_EMB]):
+                m = np.round(index.query_emb(raws, k) @ emb["cat"].T, 4)
+                m_embs.append(m)
+                top_emb.append(_topk(m, TOP_EMB))
+                fused = fused + EMB_FUSE[k] * m
+            top_emb.append(_topk(fused, TOP_EMB))
+
         for i, q in enumerate(part):
             pool = list(top_c[i]) + list(top_s[i]) + list(top_cb[i]) + list(top_sb[i])
+            if i in emb_pos:
+                for te in top_emb:
+                    pool += list(te[emb_pos[i]])
             if i in hangul_pos:
                 pool += list(top_t[hangul_pos[i]]) + list(top_tb[hangul_pos[i]])
                 for tv in top_var:
@@ -695,7 +744,9 @@ def candidates_and_features(
             cand = np.array(sorted(set(int(c) for c in pool)), dtype=np.int64)
             cand_lists.append(cand)
             skel_t_row = m_skel_t[hangul_pos[i], cand] if i in hangul_pos else None
-            blocks.append(_pair_features(q, cand, index, res, m_compact[i, cand], m_skel[i, cand], skel_t_row))
+            emb_rows = [m[emb_pos[i], cand] for m in m_embs] if i in emb_pos else []
+            blocks.append(_pair_features(q, cand, index, res, m_compact[i, cand], m_skel[i, cand], skel_t_row,
+                                         emb_rows))
     return cand_lists, np.vstack(blocks).astype(np.float32)
 
 
@@ -711,7 +762,7 @@ def _tonnage_bonus(part: list[dict], index: CatalogIndex) -> np.ndarray:
     return TONNAGE_BONUS * np.clip(1.0 - best / 0.1, 0.0, 1.0)
 
 
-def _pair_features(q, cand, index, res, s_compact, s_skel, s_skel_t) -> np.ndarray:
+def _pair_features(q, cand, index, res, s_compact, s_skel, s_skel_t, s_embs=None) -> np.ndarray:
     n = len(cand)
     c_clean = [index.clean[c] for c in cand]
     c_compact = [index.compact[c] for c in cand]
@@ -794,6 +845,12 @@ def _pair_features(q, cand, index, res, s_compact, s_skel, s_skel_t) -> np.ndarr
     c_alpha = [index.alpha[c] for c in cand]
     s_alpha = np.max([one(fuzz.ratio, f, c_alpha) for f in alpha_forms], axis=0) if alpha_forms else np.zeros(n)
     cols += [s_alpha, s_alpha - s_alpha.max()]
+    s_embs = list(s_embs or [])
+    for k in range(MAX_EMB):  # 임베딩이 없거나 적으면 0으로 채워 피처 수를 고정
+        s_emb = s_embs[k] if k < len(s_embs) else np.zeros(n, dtype=np.float32)
+        emb_rank = np.empty(n, dtype=np.float32)
+        emb_rank[np.argsort(-s_emb, kind="mergesort")] = np.arange(n)
+        cols += [s_emb, s_emb - s_emb.max(), emb_rank]
     return np.column_stack(cols)
 
 

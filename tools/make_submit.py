@@ -19,6 +19,7 @@ test.csv는 비공개이므로 train.csv에서 정답 열을 뺀 3,000행으로 
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import re
 import shutil
@@ -120,8 +121,11 @@ def run_script(workdir: Path, test: pd.DataFrame) -> tuple[pd.DataFrame, float]:
     test.to_csv(data / "test.csv", index=False, encoding="utf-8")
     shutil.copy(OPEN_DIR / "vessel_catalog.csv", data / "vessel_catalog.csv")
     start = time.time()
+    # 평가 서버는 추론 단계에서 인터넷 차단 → HuggingFace 다운로드 시도가 있으면 여기서 실패하게 한다
+    env = dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
     proc = subprocess.run(
-        [sys.executable, "script.py"], cwd=workdir, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        [sys.executable, "script.py"], cwd=workdir, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", env=env,
     )
     elapsed = time.time() - start
     if proc.returncode != 0:

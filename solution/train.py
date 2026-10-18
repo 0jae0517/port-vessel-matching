@@ -53,10 +53,35 @@ NO_DICT = False  # --no-dict: 한글 토큰 사전·전체 이름 사전을 비�
 OOF_TAG = "latest"
 
 
+USE_VOCAB = False  # --vocab: 카탈로그 단어장 표기 피처 사용
+EMB_NAMES: list[str] = []  # --emb: models/<이름> 다국어 임베딩 (쉼표로 여러 개, 예: e5-small,labse)
+EMB_ALL = False  # --emb-all: 임베딩을 영문 쿼리에도 적용 (v13·v14 방식). 기본은 한글 쿼리만 (v15)
+EMB_PREFIX = {"e5-small": "query: ", "e5-base": "query: "}
+
+
+def emb_dir_name(k: int) -> str:
+    return "emb" if k == 0 else f"emb{k + 1}"
+
+
+def attach_embedding(index: ml.CatalogIndex, name: str) -> None:
+    """models/<name> 임베딩을 카탈로그 색인에 붙인다. 카탈로그 임베딩은 outputs/emb 캐시를 재사용."""
+    import embed_lib
+
+    embedder = embed_lib.NameEmbedder(ROOT / "models" / name, prefix=EMB_PREFIX.get(name, ""))
+    cache = ROOT / "outputs" / "emb" / f"{name}_catalog.npy"
+    cat_emb = np.load(cache) if cache.exists() else None
+    index.attach_embedder(embedder, cat_emb)
+    if cat_emb is None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        np.save(cache, index.cat_emb)
+
+
 def resources(train: pd.DataFrame, catalog: pd.DataFrame) -> dict:
     res = ml.build_resources(train, catalog)
     if NO_DICT:
         res["token_dict"], res["whole_dict"] = {}, {}
+    res["use_vocab"] = USE_VOCAB
+    res["emb_hangul_only"] = not EMB_ALL
     return res
 
 
@@ -86,7 +111,7 @@ MONOTONE_UP = {
     "s_compact", "s_skel_rom", "s_skel_trans", "s_token_set", "s_token_sort", "s_partial", "s_jw", "s_rom_compact",
     "exact", "first_eq", "num_equal", "gt_exact", "flag_prob", "type_prob",
     "s_var_ratio", "s_var_jw", "s_var_partial", "s_learn_ratio", "s_learn_top1", "s_learn_jw",
-    "s_vocab_ratio", "s_vocab_jw", "s_alpha_ratio",
+    "s_vocab_ratio", "s_vocab_jw", "s_alpha_ratio", "s_emb", "s_emb2",
 }
 MONOTONE_DOWN = {"num_conflict", "gap_gross", "gap_intl", "gap_best", "num_q_only", "num_c_only"}
 USE_MONOTONE = True
@@ -254,6 +279,8 @@ def build_submission(train, catalog, index, out_dir: Path, use_callsign: bool, u
     res = resources(train, catalog)
     res["use_callsign"] = use_callsign
     res["use_name_lookup"] = use_name_lookup
+    # 제출 폴더의 model/emb, model/emb2 … 와 각 접두어 (script.py가 이 순서대로 로드)
+    res["emb_dirs"] = [(emb_dir_name(k), EMB_PREFIX.get(n, "")) for k, n in enumerate(EMB_NAMES)]
     if out_dir.exists():
         shutil.rmtree(out_dir)
     (out_dir / "model").mkdir(parents=True)
@@ -266,6 +293,12 @@ def build_submission(train, catalog, index, out_dir: Path, use_callsign: bool, u
     with open(out_dir / "model" / "resources.pkl", "wb") as f:
         pickle.dump(res, f)
     shutil.copy(ROOT / "solution" / "match_lib.py", out_dir / "model" / "match_lib.py")
+    if EMB_NAMES:
+        # 평가 서버는 오프라인 → 가중치를 model/emb* 에 동봉하고 로컬 경로로만 로드
+        shutil.copy(ROOT / "solution" / "embed_lib.py", out_dir / "model" / "embed_lib.py")
+    for k, name in enumerate(EMB_NAMES):
+        shutil.copytree(ROOT / "models" / name, out_dir / "model" / emb_dir_name(k),
+                        ignore=shutil.ignore_patterns(".cache", "*.lock", "*.metadata", ".gitignore"))
     shutil.copy(ROOT / "solution" / "script.py", out_dir / "script.py")
     (out_dir / "requirements.txt").write_text(
         "# 평가 서버 기본 설치 패키지(pandas, numpy, lightgbm, rapidfuzz, Unidecode)만 사용\n", encoding="utf-8")
@@ -284,11 +317,17 @@ def main() -> None:
     parser.add_argument("--tag", default="latest", help="CV 결과 파일 이름 (outputs/cv/<tag>_oof.csv)")
     parser.add_argument("--ensemble-cv", action="store_true", help="단일·앙상블 조합 CV 비교")
     parser.add_argument("--ensemble", choices=list(COMBOS), help="제출 폴더를 이 앙상블 조합으로 생성")
+    parser.add_argument("--vocab", action="store_true", help="카탈로그 단어장 표기 피처 사용 (에이스 → ACE)")
+    parser.add_argument("--emb", help="다국어 임베딩 모델 이름 (models/<이름>, 쉼표로 여러 개, 예: e5-small,labse)")
+    parser.add_argument("--emb-all", action="store_true", help="임베딩을 영문 쿼리에도 적용 (v13·v14 재현용)")
     args = parser.parse_args()
-    global NO_DICT, OOF_TAG
-    NO_DICT, OOF_TAG = args.no_dict, args.tag
+    global NO_DICT, OOF_TAG, USE_VOCAB, EMB_NAMES, EMB_ALL
+    NO_DICT, OOF_TAG, USE_VOCAB, EMB_ALL = args.no_dict, args.tag, args.vocab, args.emb_all
+    EMB_NAMES = [n.strip() for n in (args.emb or "").split(",") if n.strip()]
     train, catalog = load()
     index = ml.CatalogIndex(catalog)
+    for name in EMB_NAMES:
+        attach_embedding(index, name)
     if args.cv:
         run_cv(train, catalog, index)
     if args.rowcheck:

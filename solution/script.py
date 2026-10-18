@@ -29,6 +29,11 @@ def run(
         res = pickle.load(f)
 
     index = ml.CatalogIndex(catalog)
+    # 다국어 임베딩: 동봉한 가중치(model/emb, model/emb2 …)를 로컬 경로로만 로드 (평가 서버 오프라인)
+    for dir_name, prefix in res.get("emb_dirs", []):
+        import embed_lib
+
+        index.attach_embedder(embed_lib.NameEmbedder(BASE / "model" / dir_name, prefix=prefix or ""))
     predictions = ml.predict(
         model, test, index, res,
         use_callsign=res.get("use_callsign", False),
