@@ -1,0 +1,17 @@
+# 가상환경 · 캐시
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 대회 데이터 (재배포 금지) — 각자 DACON에서 받아 배치
+open/
+baseline_submit/
+*.zip
+
+# 산출물: CV OOF(train 행 포함), 제출 폴더(resources.pkl에 train 정답 조회표 포함)
+outputs/
+
+# 기타
+.DS_Store
+Thumbs.db

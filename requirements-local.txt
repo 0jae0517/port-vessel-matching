@@ -1,0 +1,13 @@
+# 대회 평가 서버 기본 설치 패키지와 같은 버전 (Python 3.11.17)
+# torch는 CUDA 12.8 빌드라서 requirements-torch.txt로 따로 설치
+pandas==2.0.3
+numpy==1.26.4
+scipy==1.15.3
+scikit-learn==1.5.2
+joblib==1.5.2
+threadpoolctl==3.7.0
+lightgbm==4.6.0
+catboost==1.2.8
+rapidfuzz==3.14.3
+Unidecode==1.4.0
+tqdm==4.66.5

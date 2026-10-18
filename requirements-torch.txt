@@ -1,0 +1,7 @@
+# 대회 평가 서버와 같은 torch / transformers 버전
+# pip install -r requirements-torch.txt --extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1+cu128
+transformers==4.57.6
+accelerate==1.9.0
+safetensors==0.6.2
+sentencepiece==0.2.0
