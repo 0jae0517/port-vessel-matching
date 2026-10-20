@@ -15,6 +15,7 @@ import pickle
 import shutil
 import sys
 import time
+import zlib
 
 import lightgbm as lgb
 import numpy as np
@@ -56,7 +57,18 @@ OOF_TAG = "latest"
 USE_VOCAB = False  # --vocab: 카탈로그 단어장 표기 피처 사용
 EMB_NAMES: list[str] = []  # --emb: models/<이름> 다국어 임베딩 (쉼표로 여러 개, 예: e5-small,labse)
 EMB_ALL = False  # --emb-all: 임베딩을 영문 쿼리에도 적용 (v13·v14 방식). 기본은 한글 쿼리만 (v15)
-EMB_PREFIX = {"e5-small": "query: ", "e5-base": "query: "}
+AUGMENT = 0  # --augment N: 학습 쿼리마다 노이즈 복사본 N개 추가 (v16)
+AUG_EXTRA = False  # --aug-extra: 증강에 치환·띄어쓰기·단어 순서 노이즈 추가 (v19)
+WORD_INDEX = False  # --word: 단어 단위 후보 검색·피처 (v16)
+CROSS_INDEXES: dict | None = None  # 교차 학습 (attach_cross), v21
+class _E5Prefix(dict):
+    """e5 계열(파인튜닝 모델 e5-small-ft* 포함)은 'query: ' 접두어."""
+
+    def get(self, name, default=""):
+        return "query: " if str(name).startswith("e5") else default
+
+
+EMB_PREFIX = _E5Prefix()
 
 
 def emb_dir_name(k: int) -> str:
@@ -82,6 +94,7 @@ def resources(train: pd.DataFrame, catalog: pd.DataFrame) -> dict:
         res["token_dict"], res["whole_dict"] = {}, {}
     res["use_vocab"] = USE_VOCAB
     res["emb_hangul_only"] = not EMB_ALL
+    res["word_index"] = WORD_INDEX
     return res
 
 
@@ -92,18 +105,53 @@ def training_matrix(train: pd.DataFrame, catalog: pd.DataFrame, index: ml.Catalo
     for fit_idx, prep_idx in splitter.split(train, groups=train["target_vessel_id"]):
         res = resources(train.iloc[fit_idx], catalog)
         part = train.iloc[prep_idx]
-        rows = part.to_dict("records")
-        queries = [ml.prepare_query(r, res) for r in rows]
-        truth = [index.id_to_index[r["target_vessel_id"]] for r in rows]
-        # 정답이 후보에 없으면 학습용으로만 추가
-        hit_flags: list[bool] = []
-        cands, feats = ml.candidates_and_features(queries, index, res, force=truth, hits=hit_flags)
-        hits += sum(hit_flags)
-        for cand, t in zip(cands, truth):
-            ys.append((cand == t).astype(np.int8))
-            groups.append(len(cand))
-        xs.append(feats)
-    return np.vstack(xs), np.concatenate(ys), np.asarray(groups), hits / len(train)
+        if AUGMENT:
+            # 노이즈를 건 복사본을 함께 학습: 거친 쿼리에서 무엇을 믿을지 모델이 배우게 한다
+            import augment as aug_mod
+
+            aug_mod.EXTRA_NOISE = AUG_EXTRA
+            part = pd.concat([part, aug_mod.augment(part, AUGMENT)], ignore_index=True)
+        # 교차 학습: 파인튜닝 임베딩은 그 선박을 학습하지 않은 절반 모델로 피처를 계산 (누수 방지)
+        if CROSS_INDEXES:
+            halves = part["target_vessel_id"].map(vessel_half).to_numpy()
+            chunks = [(part[halves == h], CROSS_INDEXES[h]) for h in (0, 1)]
+        else:
+            chunks = [(part, index)]
+        for chunk, idx in chunks:
+            if chunk.empty:
+                continue
+            rows = chunk.to_dict("records")
+            queries = [ml.prepare_query(r, res) for r in rows]
+            truth = [idx.id_to_index[r["target_vessel_id"]] for r in rows]
+            # 정답이 후보에 없으면 학습용으로만 추가
+            hit_flags: list[bool] = []
+            cands, feats = ml.candidates_and_features(queries, idx, res, force=truth, hits=hit_flags)
+            hits += sum(hit_flags)
+            for cand, t in zip(cands, truth):
+                ys.append((cand == t).astype(np.int8))
+                groups.append(len(cand))
+            xs.append(feats)
+    return np.vstack(xs), np.concatenate(ys), np.asarray(groups), hits / len(groups)  # 증강 행 포함
+
+
+def vessel_half(vessel_id: str) -> int:
+    """교차 학습용 선박 절반 나누기 (finetune_emb.py 와 같은 규칙)."""
+    return zlib.crc32(str(vessel_id).encode()) % 2
+
+
+def attach_cross(names_by_half: dict[int, str], other: list[str]) -> dict[int, ml.CatalogIndex]:
+    """CROSS_INDEXES 만들기: 절반 h 선박의 피처는 '나머지 절반(1-h)으로 학습한 모델'로 계산한다.
+
+    names_by_half: {0: 절반 0으로 학습한 모델 이름, 1: 절반 1로 학습한 모델 이름}, other: 함께 쓸 임베딩(LaBSE 등)
+    """
+    _, catalog = load()
+    out = {}
+    for h in (0, 1):
+        idx = ml.CatalogIndex(catalog)
+        for name in [names_by_half[1 - h], *other]:
+            attach_embedding(idx, name)
+        out[h] = idx
+    return out
 
 
 # 단조 제약: 유사도·국적·선종 확률은 높을수록(+), 톤수 차이·번호 충돌은 클수록(-) 점수가 낮아지도록 강제
@@ -111,7 +159,7 @@ MONOTONE_UP = {
     "s_compact", "s_skel_rom", "s_skel_trans", "s_token_set", "s_token_sort", "s_partial", "s_jw", "s_rom_compact",
     "exact", "first_eq", "num_equal", "gt_exact", "flag_prob", "type_prob",
     "s_var_ratio", "s_var_jw", "s_var_partial", "s_learn_ratio", "s_learn_top1", "s_learn_jw",
-    "s_vocab_ratio", "s_vocab_jw", "s_alpha_ratio", "s_emb", "s_emb2",
+    "s_vocab_ratio", "s_vocab_jw", "s_alpha_ratio", "s_emb", "s_emb2", "word_hit",
 }
 MONOTONE_DOWN = {"num_conflict", "gap_gross", "gap_intl", "gap_best", "num_q_only", "num_c_only"}
 USE_MONOTONE = True
@@ -320,14 +368,22 @@ def main() -> None:
     parser.add_argument("--vocab", action="store_true", help="카탈로그 단어장 표기 피처 사용 (에이스 → ACE)")
     parser.add_argument("--emb", help="다국어 임베딩 모델 이름 (models/<이름>, 쉼표로 여러 개, 예: e5-small,labse)")
     parser.add_argument("--emb-all", action="store_true", help="임베딩을 영문 쿼리에도 적용 (v13·v14 재현용)")
+    parser.add_argument("--augment", type=int, default=0, help="학습 쿼리마다 노이즈 복사본 N개 추가")
+    parser.add_argument("--word", action="store_true", help="단어 단위 후보 검색·피처 사용")
+    parser.add_argument("--aug-extra", action="store_true", help="증강에 치환·띄어쓰기·단어 순서 노이즈 추가")
+    parser.add_argument("--cross", help="교차 학습 절반 모델 '절반0 모델,절반1 모델' (--emb 첫 모델 자리를 대신해 학습 피처 계산, v21)")
     args = parser.parse_args()
-    global NO_DICT, OOF_TAG, USE_VOCAB, EMB_NAMES, EMB_ALL
+    global NO_DICT, OOF_TAG, USE_VOCAB, EMB_NAMES, EMB_ALL, AUGMENT, WORD_INDEX, AUG_EXTRA, CROSS_INDEXES
     NO_DICT, OOF_TAG, USE_VOCAB, EMB_ALL = args.no_dict, args.tag, args.vocab, args.emb_all
+    AUGMENT, WORD_INDEX, AUG_EXTRA = args.augment, args.word, args.aug_extra
     EMB_NAMES = [n.strip() for n in (args.emb or "").split(",") if n.strip()]
     train, catalog = load()
     index = ml.CatalogIndex(catalog)
     for name in EMB_NAMES:
         attach_embedding(index, name)
+    if args.cross:
+        h0, h1 = [n.strip() for n in args.cross.split(",")]
+        CROSS_INDEXES = attach_cross({0: h0, 1: h1}, EMB_NAMES[1:])
     if args.cv:
         run_cv(train, catalog, index)
     if args.rowcheck:

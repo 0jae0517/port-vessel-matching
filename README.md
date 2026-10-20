@@ -6,10 +6,15 @@
 - **평가**: `0.7 × 한글 기록 정확도 + 0.3 × 비한글 기록 정확도`
 - **대회 규칙·평가·데이터 설명**: [`docs/`](docs/)
 
-| | Public | 한글 오답 | 비한글 오답 |
+- **2026-10-19 평가 방식 변경**: 평가 데이터 추가 + Private 도입, 리더보드 초기화 ([`docs/05_leaderboard_update.md`](docs/05_leaderboard_update.md))
+
+| | 새 Public (10/19~) | 서버 추론 | 이전 Public (3,000건) |
 |---|---|---|---|
-| 베이스라인 (RandomForest) | 0.48066 | 220 | 54 |
-| **현재 최고: v14** | **0.996778** | **1** | **8** |
+| 베이스라인 (RandomForest) | – | – | 0.48066 |
+| v11 | 0.88829 | – | 0.992444 |
+| v14 | 0.90165 | 3분 52초 | 0.996778 |
+| v16 | 0.91379 | 4분 12초 | – |
+| **현재 최고: v21** (파인튜닝 e5 + 교차 학습) | **0.91740** | 4분 13초 | – |
 
 ---
 
@@ -64,13 +69,14 @@ baseline_submit/            # baseline_submit.zip 압축 해제 (베이스라인
 # 전체 train으로 학습 → 제출 폴더 생성 (현재 최고 v14 설정)
 .venv\Scripts\python.exe solution\train.py --out outputs\submissions\v14\src --no-dict --emb e5-small,labse --emb-all --callsign --name-lookup
 
-# 대회 규칙 검사 + 오프라인 서버 흉내 실행 + submit.zip 생성
+# 대회 규칙 검사 + 오프라인 서버 흉내 실행 + submit_v14.zip 생성 (zip 이름 = 폴더 이름)
 .venv\Scripts\python.exe tools\make_submit.py outputs\submissions\v14\src outputs\submissions\v14
 ```
 
 - `make_submit.py` 결과 FAIL 0건일 때만 제출
 - 소요 시간: 학습 약 6분 · CV 약 30분 · 추론 로컬(GTX 1070) 약 270초 / 서버(L4) 약 2분 예상
-- v14 submit.zip 약 1.9GB (임베딩 가중치 동봉)
+- `submit_v14.zip` 약 1.9GB (임베딩 가중치 동봉)
+- zip 이름은 `submit_<버전>.zip` (버전 = 출력 폴더 이름, `--name`으로 지정 가능). DACON은 파일 이름이 아니라 zip 내부 구조만 검사
 
 ### `train.py` 옵션
 
@@ -86,6 +92,25 @@ baseline_submit/            # baseline_submit.zip 압축 해제 (베이스라인
 | `--rowcheck` | 행 단위 랜덤 분할로 조회 규칙 효과 확인 |
 | `--ensemble-cv` / `--ensemble NAME` | LightGBM 시드·CatBoost 앙상블 비교 / 앙상블 제출 생성 (미채택) |
 | `--vocab` | 카탈로그 단어장 표기 피처 사용 (v12, Public 하락으로 미채택) |
+| `--augment N` | 학습 쿼리마다 노이즈 복사본 N개 추가 (`solution/augment.py`, v16) |
+| `--word` | 단어 단위 후보 검색·피처 (단어 하나가 빠진 쿼리 대응, v16) |
+| `--aug-extra` | 증강에 글자 치환·띄어쓰기·단어 순서 노이즈 추가 (v19) |
+| `--cross H0,H1` | 교차 학습: LightGBM 학습 피처를 절반 모델로 계산 (`--emb` 첫 모델 자리, 제출용. v21) |
+
+### 파인튜닝 임베딩 (v21)
+
+```bash
+# 전체 train으로 e5-small 파인튜닝 + 교차 학습용 절반 모델 2개 (각 약 10분, GPU)
+.venv\Scripts\python.exe solution\finetune_emb.py --out e5-small-ft --epochs 3
+.venv\Scripts\python.exe solution\finetune_emb.py --half 0 --out e5-small-fth0 --epochs 3
+.venv\Scripts\python.exe solution\finetune_emb.py --half 1 --out e5-small-fth1 --epochs 3
+
+# 제출 폴더: 추론은 e5-small-ft, 학습 피처는 절반 모델로 (v16 설정 + 파인튜닝)
+.venv\Scripts\python.exe solution\train.py --out outputs\submissions\v21\src --no-dict --emb e5-small-ft,labse --emb-all --callsign --name-lookup --augment 1 --word --cross e5-small-fth0,e5-small-fth1
+```
+
+- `--fold 0`: fold 0 검증 선박을 빼고 학습 + 임베딩 단독 한글 top-1 평가 (스트레스 테스트용 `e5-small-ft0`, `e5-small-ft0h0/h1`)
+- 저장 시 토크나이저 정규식 경고가 뜨지만 기본 e5-small과 토큰화 결과 동일 (무시 가능)
 
 ---
 
@@ -93,14 +118,14 @@ baseline_submit/            # baseline_submit.zip 압축 해제 (베이스라인
 
 ```
 port-vessel-matching/
-├── docs/                    # 대회 안내: 01_overview · 02_evaluation · 03_rules · 04_data
+├── docs/                    # 대회 안내: 01_overview · 02_evaluation · 03_rules · 04_data · 05_leaderboard_update
 ├── solution/
 │   ├── match_lib.py         # 전처리 · 로마자 변환 · 후보 검색 · 피처 · 예측 (제출 시 model/에 복사됨)
 │   ├── embed_lib.py         # 다국어 임베딩 (오프라인 · 로컬 경로 전용, 제출 시 model/에 복사됨)
 │   ├── train.py             # 학습 · CV · 제출 폴더 생성
 │   └── script.py            # 평가 서버 추론 진입점 (data/ → output/submission.csv)
 ├── tools/
-│   ├── make_submit.py       # 대회 규칙 자동 검사 + 오프라인 서버 흉내 실행 + submit.zip 생성
+│   ├── make_submit.py       # 대회 규칙 자동 검사 + 오프라인 서버 흉내 실행 + submit_<버전>.zip 생성
 │   └── download_models.py   # 다국어 임베딩 가중치 받기 → models/
 ├── analysis/
 │   ├── hangul_name_only.py      # 어려운 지표: 이름 표기만으로 한글 정답 top-1 비율
@@ -114,7 +139,7 @@ port-vessel-matching/
 ├── models/                  # ⛔ gitignore — 임베딩 가중치 (e5-small, labse …)
 ├── outputs/                 # ⛔ gitignore
 │   ├── cv/                  # CV OOF 결과 <tag>_oof.csv, 카탈로그 임베딩 캐시(emb/)
-│   └── submissions/         # 제출 폴더
+│   └── submissions/         # 제출 폴더 vNN/src/ + vNN/submit_vNN.zip
 ├── open/ · baseline_submit/ # ⛔ gitignore — 대회 데이터
 ├── requirements-local.txt   # 서버 기본 패키지와 같은 버전 (pandas, lightgbm, rapidfuzz …)
 └── requirements-torch.txt   # torch cu128 · transformers (임베딩용)
@@ -277,6 +302,59 @@ port-vessel-matching/
 | v12 | v11 + 카탈로그 단어장 피처 (`--vocab`) | – | 0.990111 | ❌ 한글 1행 추가 오답, 폐기 |
 | v13 | v11 + 다국어 임베딩 e5-small | 0.9951 | 0.994778 | ✅ 한글 −1행 (이름만 top-1 0.812 → 0.880) |
 | **v14** | v13 + LaBSE (2개 임베딩) | – | **0.996778** | ✅ **현재 최고**. 한글 −1행, 비한글 +3행 (이름만 top-1 0.880 → 0.908) |
+
+### 새 평가 방식 이후 (10/19~)
+
+- 추가된 평가 데이터가 훨씬 거침 → 모든 버전이 약 0.1 하락 (v11 0.992 → 0.888)
+- EDA(`analysis/eda_noise.py`)로 train 노이즈 규칙 파악
+  - 선박명: 64.7% 완전 일치, 나머지 편집 1~2회 (옆 글자 중복 삽입 · 삭제 · 인접 자리바꿈, 치환 1.4%), 첫/마지막 단어 하나만 변형
+  - 톤수: 52.6% 정확 일치, 나머지 대부분 ±3~5% 곱셈 오차, 결측 6.5%
+  - 국적: 결측 16.5%, 대표 영문 국적과 77% 일치 (오래된 입항 연도일수록 불일치 ↑)
+- 스트레스 검증(`analysis/stress_test.py`): 노이즈를 더 세게 건 검증 세트로 약점 확인 → 이름 편집 증가, 단어 삭제, 한글 톤수 결측에 취약
+
+| 버전 | 변경 | 새 Public | 서버 추론 | 판단 |
+|---|---|---|---|---|
+| v11 | (이전 최고 규칙 기반) | 0.88829 | – | |
+| v15 | v14, 임베딩 한글 전용 | 0.89823 | 2분 7초 | 이전 Public과 반대로 v14보다 낮음 |
+| v14 | 임베딩 e5-small + LaBSE (영문 포함) | 0.90165 | 3분 52초 | |
+| **v16** | v14 + 노이즈 증강 1배 (`--augment 1`) + 단어 단위 검색 (`--word`) | **0.91379** | 4분 12초 | ✅ |
+| v17 | v16, 증강 2배 (`--augment 2`) | 0.91272 | 4분 22초 | ➖ v16과 비슷 (증강 1배 근처가 적정) |
+| v19 | v16 + 치환·띄어쓰기·단어 순서 노이즈 (`--aug-extra`) | 0.90407 | 4분 17초 | ❌ −0.0097. 새 데이터에 없는 노이즈를 학습하면 손해 |
+| **v21** | v16 + 파인튜닝 e5-small (`e5-small-ft`) + 교차 학습 (`--cross`) | **0.91740** | 4분 13초 | ✅ 현재 최고 (+0.0036). 단어 삭제 약점은 남음 |
+
+- **진단 제출** (`v16_diag_hangul`: v16에서 비한글 예측만 고정 ID로 바꿈 → 점수 = 0.7 × 한글 정확도)
+  - 진단 점수 0.6263158 → **한글 정확도 0.8947** (= 17/19, 한글 행 수는 19의 배수)
+  - 비한글 정확도 (0.9137878 − 0.6263158) / 0.3 = **0.9582**
+  - 손실: 한글 0.0737 · 비한글 0.0125 → **손실의 85%가 한글**
+  - 기존 3,000건의 한글은 99.7% → 새로 추가된 한글 행이 훨씬 어려움
+- 스트레스 검증 (가중 정확도, 선박 1/5 검증): v16이 노이즈 시나리오에서 v14보다 크게 우세, 원본(노이즈 없음)만 0.9997 → 0.9890 손해
+
+| 시나리오 | v14 | v16 |
+|---|---|---|
+| 원본 | 0.9997 | 0.9890 |
+| 이름 편집 +2 | 0.9086 | 0.9491 |
+| 이름 편집 +4 | 0.7996 | 0.8965 |
+| 단어 하나 삭제 | 0.5544 | 0.8046 |
+| 편집+2 & 톤수·국적 결측 | 0.6484 | 0.7705 |
+
+- **e5-small 파인튜닝** (`solution/finetune_emb.py`, 대조 학습: 노이즈 쿼리 ↔ 카탈로그 영문명, hard negative)
+  - 임베딩 단독 한글 top-1 (fold 0 검증 선박): 원본 0.425 → 0.763, 편집+2 0.138 → 0.538, 단어 삭제는 0.15 → 0.16 (개선 없음)
+  - v20 (v16 + 파인튜닝 e5): 개선 없음 → 원인은 **스태킹 누수** (파인튜닝 모델이 LightGBM 학습 선박을 이미 봐서 학습 피처가 과하게 정확)
+  - v21 (v20 + **교차 학습**: 선박을 절반으로 나눠 각 절반 피처는 반대쪽 절반으로 학습한 모델로 계산, `--half`)
+
+| 시나리오 (한글 정확도, 258행) | v16 | v21 |
+|---|---|---|
+| 원본 | 0.9845 | 0.9845 |
+| 이름 편집 +1 | 0.9651 | 0.9690 |
+| 이름 편집 +2 | 0.9341 | 0.9302 |
+| 이름 편집 +4 | 0.8721 | 0.8760 |
+| 단어 하나 삭제 | **0.8256** | 0.7442 |
+| 톤수 결측 | 0.9612 | 0.9690 |
+| 톤수 오차 5~10% | 0.9729 | 0.9806 |
+| 편집+2 & 톤수 결측 | 0.7248 | **0.7674** |
+| 편집+2 & 톤수·국적 결측 | 0.6977 | **0.7287** |
+
+- v21: 톤수가 흔들리거나 빠진 경우 한글 +1~4%, 단어 삭제 −8% (파인튜닝 임베딩이 단어 삭제를 못 배움). 비한글은 거의 같음
 
 ### 배운 것
 

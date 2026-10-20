@@ -1,4 +1,4 @@
-"""제출 폴더를 대회 규칙대로 검사하고 submit.zip으로 묶는다.
+"""제출 폴더를 대회 규칙대로 검사하고 submit_<버전>.zip으로 묶는다.
 
 검사 항목 (docs/02_evaluation.md, 03_rules.md 기준)
   1. 구조: 최상위에 model/, script.py, requirements.txt (추가 상위 폴더 없음)
@@ -44,7 +44,7 @@ SERVER_PACKAGES = {
 }
 ZIP_LIMIT = 10 * 1024**3
 UNZIP_LIMIT = 32 * 1024**3
-TIME_LIMIT = 20 * 60
+TIME_LIMIT = 30 * 60  # 2026-10-19 공지로 20분 → 30분 (docs/05_leaderboard_update.md)
 N_TEST = 3000
 
 errors: list[str] = []
@@ -196,10 +196,13 @@ def build_zip(src: Path, zip_path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("src", type=Path, help="model/, script.py, requirements.txt 가 있는 폴더")
-    parser.add_argument("out_dir", type=Path, help="submit.zip 을 저장할 폴더")
+    parser.add_argument("out_dir", type=Path, help="zip 을 저장할 폴더 (폴더 이름이 버전: outputs/submissions/v14)")
     parser.add_argument("--skip-run", action="store_true", help="서버 흉내 실행 생략")
+    parser.add_argument("--name", help="버전 이름 (기본: out_dir 폴더 이름) → submit_<name>.zip")
     args = parser.parse_args()
-    src, zip_path = args.src.resolve(), args.out_dir.resolve() / "submit.zip"
+    # 여러 버전을 구분하도록 submit_<버전>.zip 으로 저장 (DACON은 zip 내부 구조만 보고 파일 이름은 보지 않음)
+    version = args.name or args.out_dir.resolve().name
+    src, zip_path = args.src.resolve(), args.out_dir.resolve() / f"submit_{version}.zip"
 
     check_structure(src)
     check_requirements(src)
@@ -211,7 +214,7 @@ def main() -> None:
         check_run(zip_path)
 
     print("\n" + "=" * 60)
-    print(f"submit.zip: {zip_path}")
+    print(f"zip: {zip_path}")
     print(f"FAIL {len(errors)}건, WARN {len(warnings)}건")
     for msg in errors:
         print(f"  FAIL: {msg}")

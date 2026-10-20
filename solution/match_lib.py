@@ -35,6 +35,9 @@ TOP_COMBINED = 30
 TOP_TONNAGE = 10
 TONNAGE_BONUS = 25.0
 TOP_EMB = 30
+TOP_WORD = 30
+WORD_CUTOFF = 80
+WORD_MAX_DF = 1500
 MAX_EMB = 2
 # 임베딩 코사인(0~1)을 이름 ratio(0~100)와 섞는 비율. 이름만 top-1 분석에서 e5-small 1.5 + LaBSE 0.5 가 최고
 EMB_FUSE = (150.0, 50.0)
@@ -516,6 +519,45 @@ class CatalogIndex:
         self.sorted_gt_idx = valid[order]
         self.sorted_gt = self.gt[self.sorted_gt_idx]
 
+    # ------------------------------------------------------------ 단어 단위 색인 (단어 하나가 빠진 쿼리 대응)
+    def build_word_index(self) -> None:
+        """카탈로그 단어(알파벳 3글자 이상) → 그 단어를 가진 선박 목록. 너무 흔한 단어는 뺀다."""
+        if getattr(self, "word_list", None) is not None:
+            return
+        postings: dict[str, list[int]] = defaultdict(list)
+        for i, name in enumerate(self.clean):
+            for w in set(name.split()):
+                if w.isalpha() and len(w) >= 3:
+                    postings[w].append(i)
+        n = len(self.clean)
+        keep = {w: idx for w, idx in postings.items() if len(idx) <= WORD_MAX_DF}
+        self.word_list = sorted(keep)
+        self.word_postings = {w: np.array(keep[w], dtype=np.int64) for w in self.word_list}
+        self.word_idf = {w: float(np.log(n / (1 + len(keep[w])))) for w in self.word_list}
+        self._word_match_cache: dict[str, list[tuple[str, float]]] = {}
+
+    def word_matches(self, form: str) -> list[tuple[str, float]]:
+        """쿼리 단어 표기 하나와 철자가 비슷한 카탈로그 단어 (ratio ≥ WORD_CUTOFF)."""
+        if form not in self._word_match_cache:
+            hits = process.extract(form, self.word_list, scorer=fuzz.ratio, score_cutoff=WORD_CUTOFF, limit=5)
+            self._word_match_cache[form] = [(w, s / 100.0) for w, s, _ in hits]
+        return self._word_match_cache[form]
+
+    def word_scores(self, word_forms: list[list[str]]) -> dict[int, float]:
+        """쿼리 단어마다 (희귀도 × 철자 유사도) 최고점을 선박별로 모아 더한다."""
+        total: dict[int, float] = defaultdict(float)
+        for forms in word_forms:
+            best: dict[int, float] = {}
+            for form in forms:
+                for w, sim in self.word_matches(form):
+                    score = self.word_idf[w] * sim
+                    for c in self.word_postings[w]:
+                        if score > best.get(int(c), 0.0):
+                            best[int(c)] = score
+            for c, s in best.items():
+                total[c] += s
+        return total
+
     # ------------------------------------------------------------ 다국어 임베딩 (선택, 최대 MAX_EMB개)
     embs: list[dict] = []
 
@@ -548,6 +590,29 @@ class CatalogIndex:
 
 
 # ---------------------------------------------------------------- 쿼리 준비
+
+def query_word_forms(tokens: list[str], res: dict) -> list[list[str]]:
+    """단어 단위 검색용: 쿼리 단어마다 영문 표기 후보 목록 (영문은 그대로, 한글은 알파벳 이름 또는 음절 학습 상위 2개)."""
+    out: list[list[str]] = []
+    for t in tokens:
+        if t.isdigit():
+            continue
+        if HANGUL_RE.search(t):
+            letters = korean_letters(t)
+            if letters:
+                forms = [letters]
+            elif _is_hangul_word(t):
+                forms = [s for s, _ in learned_word_variants(t, res.get("syl_map", {}))[:2]]
+                forms.append(romanize_variants(t)[3])
+            else:
+                forms = [romanize_token(t)]
+        else:
+            forms = [t]
+        forms = [f for f in dict.fromkeys(forms) if len(f) >= 3]
+        if forms:
+            out.append(forms)
+    return out
+
 
 def trans_compact_of(tokens: list[str]) -> str:
     return "".join(tokens)
@@ -610,6 +675,7 @@ def prepare_query(row: dict, res: dict) -> dict:
     return {
         "hangul": hangul,
         "raw": name if isinstance(name, str) else "",
+        "word_forms": query_word_forms(toks, res) if res.get("word_index") else [],
         "whole_hit": whole is not None,
         "dict_cov": covered / len(hangul_words) if hangul_words else 1.0,
         "clean": " ".join(translated),
@@ -647,6 +713,7 @@ FEATURE_NAMES = (
     "s_alpha_ratio", "rel_alpha",
     "s_emb", "rel_emb", "rank_emb",
     "s_emb2", "rel_emb2", "rank_emb2",
+    "word_hit", "rel_word_hit",
 )
 
 
@@ -725,8 +792,18 @@ def candidates_and_features(
                 fused = fused + EMB_FUSE[k] * m
             top_emb.append(_topk(fused, TOP_EMB))
 
+        # 단어 단위 후보: 쿼리 단어(희귀할수록 가중)를 가진 선박. 단어 하나가 빠진 쿼리 대응
+        word_scores: list[dict[int, float]] = []
+        if res.get("word_index"):
+            index.build_word_index()
+            word_scores = [index.word_scores(q["word_forms"]) for q in part]
+
         for i, q in enumerate(part):
             pool = list(top_c[i]) + list(top_s[i]) + list(top_cb[i]) + list(top_sb[i])
+            if word_scores and word_scores[i]:
+                ids = np.fromiter(word_scores[i].keys(), dtype=np.int64)
+                vals = np.fromiter(word_scores[i].values(), dtype=np.float64) + 0.1 * bonus[i, ids]
+                pool += [int(c) for c in ids[np.lexsort((ids, -vals))][:TOP_WORD]]
             if i in emb_pos:
                 for te in top_emb:
                     pool += list(te[emb_pos[i]])
@@ -745,8 +822,10 @@ def candidates_and_features(
             cand_lists.append(cand)
             skel_t_row = m_skel_t[hangul_pos[i], cand] if i in hangul_pos else None
             emb_rows = [m[emb_pos[i], cand] for m in m_embs] if i in emb_pos else []
+            word_row = (np.array([word_scores[i].get(int(c), 0.0) for c in cand], dtype=np.float32)
+                        if word_scores else None)
             blocks.append(_pair_features(q, cand, index, res, m_compact[i, cand], m_skel[i, cand], skel_t_row,
-                                         emb_rows))
+                                         emb_rows, word_row))
     return cand_lists, np.vstack(blocks).astype(np.float32)
 
 
@@ -762,7 +841,7 @@ def _tonnage_bonus(part: list[dict], index: CatalogIndex) -> np.ndarray:
     return TONNAGE_BONUS * np.clip(1.0 - best / 0.1, 0.0, 1.0)
 
 
-def _pair_features(q, cand, index, res, s_compact, s_skel, s_skel_t, s_embs=None) -> np.ndarray:
+def _pair_features(q, cand, index, res, s_compact, s_skel, s_skel_t, s_embs=None, s_word=None) -> np.ndarray:
     n = len(cand)
     c_clean = [index.clean[c] for c in cand]
     c_compact = [index.compact[c] for c in cand]
@@ -851,6 +930,9 @@ def _pair_features(q, cand, index, res, s_compact, s_skel, s_skel_t, s_embs=None
         emb_rank = np.empty(n, dtype=np.float32)
         emb_rank[np.argsort(-s_emb, kind="mergesort")] = np.arange(n)
         cols += [s_emb, s_emb - s_emb.max(), emb_rank]
+    if s_word is None:
+        s_word = np.zeros(n, dtype=np.float32)
+    cols += [s_word, s_word - s_word.max()]
     return np.column_stack(cols)
 
 
