@@ -34,6 +34,7 @@ import augment as A  # noqa: E402
 import match_lib as ml  # noqa: E402
 
 PREFIX = "query: "
+DROP_WORD = 0.10  # --drop-word: 학습 쿼리에서 단어 하나를 지울 확률 (v23: 0.3)
 
 
 def vessel_half(vessel_id: str) -> int:
@@ -42,10 +43,10 @@ def vessel_half(vessel_id: str) -> int:
 
 
 def name_noise(name: str, rng: random.Random) -> str:
-    """EDA 규칙 기반 이름 노이즈 (train보다 약간 거칠게): 편집 0~3회, 단어 하나 삭제 10%."""
+    """EDA 규칙 기반 이름 노이즈 (train보다 약간 거칠게): 편집 0~3회, 단어 하나 삭제 DROP_WORD."""
     row = {"vessel_name": name}
     row = A.name_edits(rng.choice([0, 0, 1, 1, 2, 3]))(row, rng)
-    if rng.random() < 0.10:
+    if rng.random() < DROP_WORD:
         row = A.drop_word(row, rng)
     return row["vessel_name"]
 
@@ -132,7 +133,10 @@ def main() -> None:
     p.add_argument("--synth", type=int, default=15000)
     p.add_argument("--temp", type=float, default=0.05)
     p.add_argument("--half", type=int, choices=[0, 1], help="교차 학습용: vessel_half()가 이 값인 선박만으로 학습")
+    p.add_argument("--drop-word", type=float, default=0.10, help="학습 쿼리 단어 하나 삭제 확률")
     args = p.parse_args()
+    global DROP_WORD
+    DROP_WORD = args.drop_word
 
     torch.manual_seed(42)
     random.seed(42)

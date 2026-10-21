@@ -14,7 +14,9 @@
 | v11 | 0.88829 | – | 0.992444 |
 | v14 | 0.90165 | 3분 52초 | 0.996778 |
 | v16 | 0.91379 | 4분 12초 | – |
-| **현재 최고: v21** (파인튜닝 e5 + 교차 학습) | **0.91740** | 4분 13초 | – |
+| v21 (파인튜닝 e5 + 교차 학습) | 0.91740 | 4분 13초 | – |
+| v22 (v21 + LLM 영문 복원) | 0.91799 | 10분 22초 | – |
+| **현재 최고: v25** (kanana LoRA 영문 복원 + 병음 역변환) | **0.92079** | 9분 26초 | – |
 
 ---
 
@@ -111,6 +113,35 @@ baseline_submit/            # baseline_submit.zip 압축 해제 (베이스라인
 
 - `--fold 0`: fold 0 검증 선박을 빼고 학습 + 임베딩 단독 한글 top-1 평가 (스트레스 테스트용 `e5-small-ft0`, `e5-small-ft0h0/h1`)
 - 저장 시 토크나이저 정규식 경고가 뜨지만 기본 e5-small과 토큰화 결과 동일 (무시 가능)
+
+### LLM 영문 복원 (v25·v26, 코드 검증용 전체 재현 경로)
+
+- DACON 답변: LLM LoRA 미세조정 + 가중치 동봉 오프라인 추론 허용, 코드 검증 때 학습·전처리·추론 전체 코드와 가중치 요청 가능 ([docs/06_qna.md](docs/06_qna.md))
+- 기반 모델: kakaocorp/kanana-1.5-2.1b-instruct-2505 (Apache 2.0). 학습 데이터는 `train.csv` 한글 행 → 정답 카탈로그 영문명뿐
+
+```bash
+# 0. 사전학습 가중치 (인터넷 필요, 로컬 1회)
+.venv\Scripts\python.exe tools\download_models.py e5-small labse kanana2b
+
+# 1. e5-small 파인튜닝 (전체 + 교차 학습용 절반 2개)
+.venv\Scripts\python.exe solution\finetune_emb.py --out e5-small-ft --epochs 3
+.venv\Scripts\python.exe solution\finetune_emb.py --half 0 --out e5-small-fth0 --epochs 3
+.venv\Scripts\python.exe solution\finetune_emb.py --half 1 --out e5-small-fth1 --epochs 3
+
+# 2. kanana 가벼운 LoRA (전체 + 절반 2개, LoRA는 원래 가중치에 병합해 저장)
+.venv\Scripts\python.exe solution\finetune_llm.py --base kanana2b --out kanana-lora --epochs 1 --lr 1e-4 --rank 8
+.venv\Scripts\python.exe solution\finetune_llm.py --base kanana2b --half 0 --out kanana-lorah0 --epochs 1 --lr 1e-4 --rank 8
+.venv\Scripts\python.exe solution\finetune_llm.py --base kanana2b --half 1 --out kanana-lorah1 --epochs 1 --lr 1e-4 --rank 8
+
+# 3. LightGBM 랭커 학습 + 제출 폴더 (v26; v25는 끝에 --pinyin 추가)
+.venv\Scripts\python.exe solution\train.py --out outputs\submissions\v26\src --no-dict --emb e5-small-ft,labse --emb-all --callsign --name-lookup --augment 1 --word --cross e5-small-fth0,e5-small-fth1 --llm kanana-lora --llm-cross kanana-lorah0,kanana-lorah1
+
+# 4. 규칙 검사 + 서버 흉내 실행 + zip
+.venv\Scripts\python.exe tools\make_submit.py outputs\submissions\v26\src outputs\submissions\v26
+```
+
+- 학습 피처용 LLM 결과는 `outputs/llm/<모델>.json`에 캐시 (지워도 다시 계산됨, 약 25분)
+- 최종 선택한 버전의 `models/` 가중치(e5-small-ft*, labse, kanana2b, kanana-lora*)는 대회 종료 후 검증이 끝날 때까지 **지우지 말 것**
 
 ---
 
@@ -314,13 +345,21 @@ port-vessel-matching/
 
 | 버전 | 변경 | 새 Public | 서버 추론 | 판단 |
 |---|---|---|---|---|
+| v5 | (규칙 기반 초기, 로마자 변형) | 0.86346 | 1분 14초 | |
 | v11 | (이전 최고 규칙 기반) | 0.88829 | – | |
+| v13 | v11 + 임베딩 e5-small | 0.89384 | 2분 45초 | |
 | v15 | v14, 임베딩 한글 전용 | 0.89823 | 2분 7초 | 이전 Public과 반대로 v14보다 낮음 |
 | v14 | 임베딩 e5-small + LaBSE (영문 포함) | 0.90165 | 3분 52초 | |
 | **v16** | v14 + 노이즈 증강 1배 (`--augment 1`) + 단어 단위 검색 (`--word`) | **0.91379** | 4분 12초 | ✅ |
 | v17 | v16, 증강 2배 (`--augment 2`) | 0.91272 | 4분 22초 | ➖ v16과 비슷 (증강 1배 근처가 적정) |
 | v19 | v16 + 치환·띄어쓰기·단어 순서 노이즈 (`--aug-extra`) | 0.90407 | 4분 17초 | ❌ −0.0097. 새 데이터에 없는 노이즈를 학습하면 손해 |
-| **v21** | v16 + 파인튜닝 e5-small (`e5-small-ft`) + 교차 학습 (`--cross`) | **0.91740** | 4분 13초 | ✅ 현재 최고 (+0.0036). 단어 삭제 약점은 남음 |
+| **v21** | v16 + 파인튜닝 e5-small (`e5-small-ft`) + 교차 학습 (`--cross`) | **0.91740** | 4분 13초 | ✅ +0.0036. 단어 삭제 약점은 남음 |
+| **v22** | v21 + Qwen2.5-3B 가벼운 LoRA 영문 복원 후보·피처 (`--llm qwen3b-lora --llm-cross qwen3b-lorah0,qwen3b-lorah1`) | **0.91799** | 10분 22초 | ✅ +0.0006 (스트레스 테스트보다 작음). zip 7.4GB |
+| v24 | v22 + 한글 → 중국어 병음 역변환 후보·피처 (`--pinyin`) | 0.91706 | 10분 17초 | ➖ −0.0009 (1행 안팎). 합성 test에서는 외국 선박 0.9756 → 0.9789 (중국 0.967 → 1.000), 한국·병음 0.9689 → 0.9733 |
+| **v25** | v24, LLM을 kanana-1.5-2.1B LoRA로 교체 (Apache 2.0) | **0.92079** | 9분 26초 | ✅ 현재 최고 (v22 대비 +0.0028). zip 5.6GB. 합성 test: 외국 0.9789 → 0.9822, 한국·병음 0.9733 → 0.9756 |
+| v27 | v25 + LightGBM 시드 3개 앙상블 (`--ensemble lgb3`) | (미제출) | 로컬 776초 | zip 5.6GB. 합성 test: 한국·병음 0.9756 → 0.9778, 외국 0.9822 → 0.9800 (±2행, 차이 없음) |
+| v26 | v22, LLM을 kanana LoRA로 교체 (병음 없음, Apache 2.0) | 0.91706 | 8분 54초 | zip 5.6GB. 합성 test: 외국 0.9822 (v25와 같음), 한국·병음 0.9711 (v25 0.9756) |
+| v23 | v22 + e5 파인튜닝 단어 삭제 노이즈 10% → 30% (`finetune_emb.py --drop-word 0.3`) | 0.91141 | 10분 10초 | ❌ −0.0066. 실제 데이터에 드문 노이즈를 강하게 학습하면 손해 (v19와 같은 패턴) |
 
 - **진단 제출** (`v16_diag_hangul`: v16에서 비한글 예측만 고정 ID로 바꿈 → 점수 = 0.7 × 한글 정확도)
   - 진단 점수 0.6263158 → **한글 정확도 0.8947** (= 17/19, 한글 행 수는 19의 배수)
@@ -355,6 +394,25 @@ port-vessel-matching/
 | 편집+2 & 톤수·국적 결측 | 0.6977 | **0.7287** |
 
 - v21: 톤수가 흔들리거나 빠진 경우 한글 +1~4%, 단어 삭제 −8% (파인튜닝 임베딩이 단어 삭제를 못 배움). 비한글은 거의 같음
+
+- **LLM 영문 복원** (`analysis/llm_translit_probe.py`, Qwen2.5 Instruct, 한글 선박명 → 영문 표기 → 카탈로그 글자 유사도 검색)
+  - LLM 단독 한글 top1 (fold 0 검증 이름 80개, 빔 4): 1.5B few-shot 0.738 · 3B few-shot 0.838 · 3B LoRA 4 epoch 0.700 (학습 선박 이름을 외워 과적합) · **3B 가벼운 LoRA (1 epoch, lr 1e-4, r 8) 0.838, top10 0.938, 행당 1.2초** (few-shot의 1/3)
+  - 파인튜닝 e5와 서로 다른 이름을 맞힘 → 두 방법 합집합 top10 0.988
+  - **kanana-1.5-2.1B 가벼운 LoRA: top1 0.863, top10 0.963, 편집+2 0.512, 행당 1.0초** → Qwen 3B보다 모든 항목에서 우수
+  - ⚠️ Qwen2.5-3B는 Qwen Research License(비상업). kanana(Apache 2.0)로 교체 (v25~)
+  - `solution/finetune_llm.py` (LoRA → 원래 가중치에 병합, 추론에 peft 불필요), `solution/llm_lib.py` (프롬프트·변환기 공용)
+- **v22** (v21 + LLM 후보 40개·피처 5개 `s_llm, s_llm1, rel_llm, rank_llm, llm_exact`, LLM도 교차 학습)
+
+| 시나리오 (한글 정확도, 258행) | v21 | v22 |
+|---|---|---|
+| 원본 | 0.9845 | 0.9845 |
+| 이름 편집 +1 | **0.9690** | 0.9574 |
+| 이름 편집 +2 | 0.9302 | **0.9380** |
+| 이름 편집 +4 | 0.8760 | **0.8876** |
+| 단어 하나 삭제 | 0.7442 | **0.7791** |
+| 톤수 결측 | 0.9690 | 0.9690 |
+| 편집+2 & 톤수 결측 | 0.7674 | **0.7907** |
+| 편집+2 & 톤수·국적 결측 | 0.7287 | **0.7519** |
 
 ### 배운 것
 

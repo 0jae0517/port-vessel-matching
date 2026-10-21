@@ -29,6 +29,20 @@ def run(
         res = pickle.load(f)
 
     index = ml.CatalogIndex(catalog)
+    # LLM 영문 복원 (한글 쿼리만): 동봉한 LoRA 병합 가중치 model/llm. 이름마다 단독(배치 1)·결정적으로 생성하므로
+    # 같은 이름은 어떤 조합으로 실행해도 결과가 같다. 임베딩 모델을 올리기 전에 계산하고 GPU에서 내린다.
+    if res.get("llm_dir"):
+        import llm_lib
+        import torch
+
+        llm = llm_lib.Transliterator(BASE / "model" / res["llm_dir"], beams=res.get("llm_beams", 4))
+        for name in test["vessel_name"]:
+            if ml.is_hangul(name):
+                llm(name)
+        outputs = llm.cache
+        del llm
+        torch.cuda.empty_cache()
+        index.attach_llm(outputs.__getitem__)
     # 다국어 임베딩: 동봉한 가중치(model/emb, model/emb2 …)를 로컬 경로로만 로드 (평가 서버 오프라인)
     for dir_name, prefix in res.get("emb_dirs", []):
         import embed_lib

@@ -13,8 +13,14 @@ MODELS = {
     "e5-small": "intfloat/multilingual-e5-small",
     "e5-base": "intfloat/multilingual-e5-base",
     "minilm": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    # 한글 선박명 → 영문 철자 복원 실험용 소형 LLM (Apache 2.0)
+    "qwen1.5b": "Qwen/Qwen2.5-1.5B-Instruct",
+    "qwen3b": "Qwen/Qwen2.5-3B-Instruct",
+    # 카탈로그 영문명 → 한글 표기 합성용 (한국어 특화, Apache 2.0). 로컬 데이터 생성에만 사용
+    "kanana2b": "kakaocorp/kanana-1.5-2.1b-instruct-2505",
 }
-PATTERNS = ["config.json", "*.safetensors", "tokenizer*", "vocab.txt", "sentencepiece.bpe.model",
+PATTERNS = ["config.json", "*.safetensors", "*.safetensors.index.json", "tokenizer*", "vocab.txt", "vocab.json",
+            "merges.txt", "generation_config.json", "sentencepiece.bpe.model",
             "special_tokens_map.json", "modules.json", "1_Pooling/*", "2_Dense/*"]
 
 for name in sys.argv[1:] or list(MODELS):

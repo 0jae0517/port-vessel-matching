@@ -61,6 +61,10 @@ AUGMENT = 0  # --augment N: 학습 쿼리마다 노이즈 복사본 N개 추가 
 AUG_EXTRA = False  # --aug-extra: 증강에 치환·띄어쓰기·단어 순서 노이즈 추가 (v19)
 WORD_INDEX = False  # --word: 단어 단위 후보 검색·피처 (v16)
 CROSS_INDEXES: dict | None = None  # 교차 학습 (attach_cross), v21
+USE_LLM = False  # LLM 영문 복원 후보·피처 (한글 쿼리), v22
+LLM_NAME = ""  # --llm: 추론에 쓸 models/<이름> (LoRA 병합 모델)
+USE_PINYIN = False  # --pinyin: 한글 → 중국어 병음 역변환 후보·피처, v24
+LLM_BEAMS = 4
 class _E5Prefix(dict):
     """e5 계열(파인튜닝 모델 e5-small-ft* 포함)은 'query: ' 접두어."""
 
@@ -95,7 +99,69 @@ def resources(train: pd.DataFrame, catalog: pd.DataFrame) -> dict:
     res["use_vocab"] = USE_VOCAB
     res["emb_hangul_only"] = not EMB_ALL
     res["word_index"] = WORD_INDEX
+    res["use_llm"] = USE_LLM
+    res["use_pinyin"] = USE_PINYIN
     return res
+
+
+class LLMCache:
+    """models/<name> LLM의 이름 → 영문 복원 결과. outputs/llm/<name>.json 에 저장해 재사용.
+
+    없는 이름은 그때 LLM을 올려 계산한다 (GPU 메모리를 아끼려면 warm()으로 미리 채운다).
+    """
+
+    def __init__(self, name: str, beams: int = 4) -> None:
+        import json
+
+        self.name, self.beams = name, beams
+        self.path = ROOT / "outputs" / "llm" / f"{name}.json"
+        self.data: dict[str, list[str]] = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        self._model = None
+
+    def __call__(self, name: str) -> list[str]:
+        if name not in self.data:
+            if self._model is None:
+                from llm_lib import Transliterator
+
+                self._model = Transliterator(ROOT / "models" / self.name, beams=self.beams)
+            self.data[name] = self._model(name)
+        return self.data[name]
+
+    def warm(self, names) -> None:
+        """이름들을 미리 계산해 저장하고 LLM을 내린다."""
+        import json
+
+        todo = [n for n in dict.fromkeys(names) if n not in self.data]
+        t0 = time.time()
+        for k, n in enumerate(todo):
+            self(n)
+            if (k + 1) % 200 == 0:
+                print(f"    [{self.name}] {k + 1}/{len(todo)} ({time.time() - t0:.0f}s)", flush=True)
+        self.save()
+        if self._model is not None:
+            import torch
+
+            self._model = None
+            torch.cuda.empty_cache()
+        print(f"  LLM {self.name}: {len(todo)}개 새로 계산 ({time.time() - t0:.0f}s), 캐시 {len(self.data)}개", flush=True)
+
+    def save(self) -> None:
+        import json
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+
+
+def training_names(train: pd.DataFrame) -> list[str]:
+    """training_matrix 가 LLM에 넣을 한글 이름 (원본 + AUGMENT 증강본). 증강은 행마다 결정적이다."""
+    frames = [train]
+    if AUGMENT:
+        import augment as aug_mod
+
+        aug_mod.EXTRA_NOISE = AUG_EXTRA
+        frames.append(aug_mod.augment(train, AUGMENT))
+    names = pd.concat(frames)["vessel_name"]
+    return [str(n) for n in names if ml.is_hangul(n)]
 
 
 def training_matrix(train: pd.DataFrame, catalog: pd.DataFrame, index: ml.CatalogIndex, inner: int = 5):
@@ -139,10 +205,12 @@ def vessel_half(vessel_id: str) -> int:
     return zlib.crc32(str(vessel_id).encode()) % 2
 
 
-def attach_cross(names_by_half: dict[int, str], other: list[str]) -> dict[int, ml.CatalogIndex]:
+def attach_cross(names_by_half: dict[int, str], other: list[str],
+                 llm_by_half: dict[int, str] | None = None) -> dict[int, ml.CatalogIndex]:
     """CROSS_INDEXES 만들기: 절반 h 선박의 피처는 '나머지 절반(1-h)으로 학습한 모델'로 계산한다.
 
     names_by_half: {0: 절반 0으로 학습한 모델 이름, 1: 절반 1로 학습한 모델 이름}, other: 함께 쓸 임베딩(LaBSE 등)
+    llm_by_half: 같은 규칙의 LoRA LLM 이름 (v22)
     """
     _, catalog = load()
     out = {}
@@ -150,8 +218,17 @@ def attach_cross(names_by_half: dict[int, str], other: list[str]) -> dict[int, m
         idx = ml.CatalogIndex(catalog)
         for name in [names_by_half[1 - h], *other]:
             attach_embedding(idx, name)
+        if llm_by_half:
+            idx.attach_llm(LLMCache(llm_by_half[1 - h]))
         out[h] = idx
     return out
+
+
+def warm_cross_llm(train: pd.DataFrame, llm_by_half: dict[int, str]) -> None:
+    """교차 학습용 LLM 캐시를 미리 채운다: 절반 h 선박의 학습 이름은 절반 1-h 모델로."""
+    halves = train["target_vessel_id"].map(vessel_half).to_numpy()
+    for h in (0, 1):
+        LLMCache(llm_by_half[1 - h]).warm(training_names(train[halves == h]))
 
 
 # 단조 제약: 유사도·국적·선종 확률은 높을수록(+), 톤수 차이·번호 충돌은 클수록(-) 점수가 낮아지도록 강제
@@ -160,6 +237,7 @@ MONOTONE_UP = {
     "exact", "first_eq", "num_equal", "gt_exact", "flag_prob", "type_prob",
     "s_var_ratio", "s_var_jw", "s_var_partial", "s_learn_ratio", "s_learn_top1", "s_learn_jw",
     "s_vocab_ratio", "s_vocab_jw", "s_alpha_ratio", "s_emb", "s_emb2", "word_hit",
+    "s_llm", "s_llm1", "llm_exact", "s_pinyin",
 }
 MONOTONE_DOWN = {"num_conflict", "gap_gross", "gap_intl", "gap_best", "num_q_only", "num_c_only"}
 USE_MONOTONE = True
@@ -329,6 +407,8 @@ def build_submission(train, catalog, index, out_dir: Path, use_callsign: bool, u
     res["use_name_lookup"] = use_name_lookup
     # 제출 폴더의 model/emb, model/emb2 … 와 각 접두어 (script.py가 이 순서대로 로드)
     res["emb_dirs"] = [(emb_dir_name(k), EMB_PREFIX.get(n, "")) for k, n in enumerate(EMB_NAMES)]
+    if USE_LLM:
+        res["llm_dir"], res["llm_beams"] = "llm", LLM_BEAMS
     if out_dir.exists():
         shutil.rmtree(out_dir)
     (out_dir / "model").mkdir(parents=True)
@@ -346,6 +426,10 @@ def build_submission(train, catalog, index, out_dir: Path, use_callsign: bool, u
         shutil.copy(ROOT / "solution" / "embed_lib.py", out_dir / "model" / "embed_lib.py")
     for k, name in enumerate(EMB_NAMES):
         shutil.copytree(ROOT / "models" / name, out_dir / "model" / emb_dir_name(k),
+                        ignore=shutil.ignore_patterns(".cache", "*.lock", "*.metadata", ".gitignore"))
+    if USE_LLM:
+        shutil.copy(ROOT / "solution" / "llm_lib.py", out_dir / "model" / "llm_lib.py")
+        shutil.copytree(ROOT / "models" / LLM_NAME, out_dir / "model" / "llm",
                         ignore=shutil.ignore_patterns(".cache", "*.lock", "*.metadata", ".gitignore"))
     shutil.copy(ROOT / "solution" / "script.py", out_dir / "script.py")
     (out_dir / "requirements.txt").write_text(
@@ -372,18 +456,35 @@ def main() -> None:
     parser.add_argument("--word", action="store_true", help="단어 단위 후보 검색·피처 사용")
     parser.add_argument("--aug-extra", action="store_true", help="증강에 치환·띄어쓰기·단어 순서 노이즈 추가")
     parser.add_argument("--cross", help="교차 학습 절반 모델 '절반0 모델,절반1 모델' (--emb 첫 모델 자리를 대신해 학습 피처 계산, v21)")
+    parser.add_argument("--llm", help="LLM 영문 복원 모델 (models/<이름>, 한글 쿼리 후보·피처, v22)")
+    parser.add_argument("--llm-cross", help="LLM 교차 학습 절반 모델 '절반0 모델,절반1 모델' (--cross 와 함께)")
+    parser.add_argument("--pinyin", action="store_true", help="한글 → 중국어 병음 역변환 후보·피처 (v24)")
     args = parser.parse_args()
     global NO_DICT, OOF_TAG, USE_VOCAB, EMB_NAMES, EMB_ALL, AUGMENT, WORD_INDEX, AUG_EXTRA, CROSS_INDEXES
+    global USE_LLM, LLM_NAME, USE_PINYIN
+    USE_PINYIN = args.pinyin
     NO_DICT, OOF_TAG, USE_VOCAB, EMB_ALL = args.no_dict, args.tag, args.vocab, args.emb_all
     AUGMENT, WORD_INDEX, AUG_EXTRA = args.augment, args.word, args.aug_extra
     EMB_NAMES = [n.strip() for n in (args.emb or "").split(",") if n.strip()]
     train, catalog = load()
+    llm_halves = None
+    if args.llm:
+        USE_LLM, LLM_NAME = True, args.llm
+        # 임베딩 모델을 올리기 전에 학습 이름의 LLM 결과를 미리 계산 (GPU 메모리)
+        if args.llm_cross:
+            h0, h1 = [n.strip() for n in args.llm_cross.split(",")]
+            llm_halves = {0: h0, 1: h1}
+            warm_cross_llm(train, llm_halves)
+        else:
+            LLMCache(LLM_NAME).warm(training_names(train))
     index = ml.CatalogIndex(catalog)
     for name in EMB_NAMES:
         attach_embedding(index, name)
+    if args.llm:
+        index.attach_llm(LLMCache(LLM_NAME))
     if args.cross:
         h0, h1 = [n.strip() for n in args.cross.split(",")]
-        CROSS_INDEXES = attach_cross({0: h0, 1: h1}, EMB_NAMES[1:])
+        CROSS_INDEXES = attach_cross({0: h0, 1: h1}, EMB_NAMES[1:], llm_halves)
     if args.cv:
         run_cv(train, catalog, index)
     if args.rowcheck:
