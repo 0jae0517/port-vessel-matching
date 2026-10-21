@@ -1,0 +1,23 @@
+# 로컬 학습·실험 환경 (Python 3.11.17). 제출물 requirements.txt 와 다름 — 제출물은 서버 기본 패키지만 사용
+# 설치: uv venv --python 3.11.17 .venv
+#       uv pip install --python .venv -r requirements-dev.txt --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match
+# 서버(평가)와 같은 버전으로 고정
+torch==2.7.1+cu128
+transformers==4.57.6
+accelerate==1.9.0
+safetensors==0.6.2
+sentencepiece==0.2.0
+tokenizers==0.22.2
+numpy==1.26.4
+pandas==2.0.3
+scipy==1.15.3
+scikit-learn==1.5.2
+lightgbm==4.6.0
+catboost==1.2.8
+RapidFuzz==3.14.3
+Unidecode==1.4.0
+tqdm==4.66.5
+# 로컬 전용 (학습·다운로드)
+peft==0.17.1
+huggingface_hub==0.36.2
+hf-xet==1.7.0

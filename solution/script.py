@@ -43,6 +43,11 @@ def run(
         del llm
         torch.cuda.empty_cache()
         index.attach_llm(outputs.__getitem__)
+    # 카탈로그명의 한글 표기표 (공식 카탈로그로 미리 계산, model/catalog_hangul.json)
+    if res.get("use_khan"):
+        import json
+
+        index.attach_catalog_hangul(json.loads((BASE / "model" / "catalog_hangul.json").read_text(encoding="utf-8")))
     # 다국어 임베딩: 동봉한 가중치(model/emb, model/emb2 …)를 로컬 경로로만 로드 (평가 서버 오프라인)
     for dir_name, prefix in res.get("emb_dirs", []):
         import embed_lib

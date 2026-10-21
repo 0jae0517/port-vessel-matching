@@ -70,7 +70,7 @@ def main() -> None:
     # v22·v23·v24: Qwen 3B LoRA / v25·v26: kanana LoRA (fold 0 학습 선박으로만 학습)
     LLMS = {"qwen": ("qwen3b-lora0-light", {0: "qwen3b-lora0h0", 1: "qwen3b-lora0h1"}),
             "kanana": ("kanana-lora0-light", {0: "kanana-lora0h0", 1: "kanana-lora0h1"})}
-    llm_of = {"v22": "qwen", "v23": "qwen", "v24": "qwen", "v25": "kanana", "v26": "kanana"}
+    llm_of = {"v22": "qwen", "v23": "qwen", "v24": "qwen", "v25": "kanana", "v26": "kanana", "v28": "kanana"}
     for kind in dict.fromkeys(llm_of[c] for c in configs if c in llm_of):
         full, halves = LLMS[kind]
         T.AUGMENT = 1
@@ -89,7 +89,7 @@ def main() -> None:
             # v20: 파인튜닝 e5(fold 0 학습 선박으로만 학습한 e5-small-ft0) + LaBSE
             # v23: e5 파인튜닝에 단어 삭제 노이즈 강화 (--drop-word 0.3) → e5-small-ft0w
             names = (("e5-small-ft0w", "labse") if cfg == "v23" else
-                     ("e5-small-ft0", "labse") if cfg in ("v20", "v21", "v22", "v24", "v25", "v26")
+                     ("e5-small-ft0", "labse") if cfg in ("v20", "v21", "v22", "v24", "v25", "v26", "v28")
                      else ("e5-small", "labse"))
             if names not in emb_indexes:
                 emb_indexes[names] = ml.CatalogIndex(catalog)
@@ -98,7 +98,7 @@ def main() -> None:
             index = emb_indexes[names]
         # v14: 임베딩(영문 포함) / v15: 임베딩 한글 전용 / v16: v14 + 노이즈 증강 + 단어 단위 검색
         # v16a: v14 + 노이즈 증강만 / v16w: v14 + 단어 단위 검색만 / v20: v16 + 파인튜닝 e5
-        late = ("v20", "v21", "v22", "v23", "v24", "v25", "v26")
+        late = ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v28")
         T.EMB_ALL = cfg in ("v14", "v16", "v16a", "v16w", *late)
         T.AUGMENT = 1 if cfg in ("v16", "v16a", *late) else 0
         T.WORD_INDEX = cfg in ("v16", "v16w", *late)
@@ -107,7 +107,11 @@ def main() -> None:
         use_llm = cfg in llm_of
         llm_full, llm_halves = LLMS[llm_of[cfg]] if use_llm else (None, None)
         T.USE_LLM = use_llm
-        T.USE_PINYIN = cfg in ("v24", "v25")
+        T.USE_PINYIN = cfg in ("v24", "v25", "v28")
+        # v28: v25 + 카탈로그명 한글 표기표와 한글끼리 비교 (tools/translit_catalog.py)
+        T.KHAN_FILE = ROOT / "outputs" / "translit" / "kanana2b.json" if cfg == "v28" else None
+        if T.KHAN_FILE is not None and index.cat_khan is None:
+            T.attach_khan(index)
         T.CROSS_INDEXES = None
         if cfg in ("v21", *llm_of):
             halves = {0: "e5-small-ft0wh0", 1: "e5-small-ft0wh1"} if cfg == "v23" else {0: "e5-small-ft0h0", 1: "e5-small-ft0h1"}

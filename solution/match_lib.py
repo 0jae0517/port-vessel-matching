@@ -585,6 +585,19 @@ class CatalogIndex:
     def attach_llm(self, fn) -> None:
         self.llm = fn
 
+    # ------------------------------------------------------------ 카탈로그명의 한글 표기 (선택, v28)
+    cat_khan: list[list[str]] | None = None  # 표기 변형 슬롯별 카탈로그 행 순서의 자모열
+
+    def attach_catalog_hangul(self, table: dict[str, str | list[str]]) -> None:
+        """{카탈로그 영문명: 한글 표기 또는 표기 목록} → 슬롯별 자모열 (표기가 여러 개면 비교 때 최고점, 없으면 '')."""
+        rows = []
+        for n in self.catalog["vessel_name"].astype(str):
+            v = table.get(n, "")
+            rows.append([jamo_compact(x) for x in ([v] if isinstance(v, str) else v)] or [""])
+        width = max(len(r) for r in rows)
+        # 표기가 적은 이름은 첫 표기로 채워 슬롯 수를 맞춘다 (최고점 계산에 영향 없음)
+        self.cat_khan = [[r[min(k, len(r) - 1)] for r in rows] for k in range(width)]
+
     def nearest_gt(self, value: float | None, count: int) -> list[int]:
         if value is None:
             return []
@@ -657,8 +670,9 @@ def _py_hangul(cho: int, sylls: list[tuple[int, int]]) -> str:
     return "".join(out)
 
 
-def _build_pinyin_map() -> dict[str, list[str]]:
-    forms: dict[str, list[tuple[int, int]]] = {}  # 병음 음절 → (초성, 음절들)
+def _py_forms() -> dict[str, tuple[str, str, int, list[tuple[int, int]]]]:
+    """병음 음절 → (성모, 운모, 초성, 공식 표기 음절들)."""
+    forms: dict[str, tuple[str, str, int, list[tuple[int, int]]]] = {}
     for ini in ("zh", "ch", "sh", "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h", "j", "q", "x", "r", "z", "c", "s"):
         for fin, sy in _PY_FIN.items():
             if ini in ("j", "q", "x"):
@@ -668,39 +682,88 @@ def _build_pinyin_map() -> dict[str, list[str]]:
                     continue
             elif fin.startswith("i") and ini not in ("b", "p", "m", "d", "t", "n", "l"):
                 continue  # shiang, gin … 같은 음절은 병음에 없음
-            forms[ini + fin] = (_PY_CHO[ini], sy)
+            forms[ini + fin] = (ini, fin, _PY_CHO[ini], sy)
         if ini in ("j", "q", "x"):
-            forms[ini + "ue"] = (_PY_CHO[ini], _PY_V["ue"])
+            forms[ini + "ue"] = (ini, "ue", _PY_CHO[ini], _PY_V["ue"])
     for b in ("zhi", "chi", "shi", "ri", "zi", "ci", "si"):
-        forms[b] = (_PY_CHO[b[:-1]], [(18, 0)])
+        forms[b] = (b[:-1], "i", _PY_CHO[b[:-1]], [(18, 0)])
     for fin in ("a", "o", "e", "ai", "ei", "ao", "ou", "an", "en", "ang", "eng", "er"):
-        forms[fin] = (11, _PY_FIN[fin])
+        forms[fin] = ("", fin, 11, _PY_FIN[fin])
     for k, fin in _PY_Y.items():
-        forms[k] = (11, _PY_FIN[fin])
+        forms[k] = ("y", fin, 11, _PY_FIN[fin])
     for k, fin in {"yu": "u", "yue": "ue", "yuan": "uan", "yun": "un"}.items():
-        forms[k] = (11, _PY_V[fin])
+        forms[k] = ("y", fin, 11, _PY_V[fin])
     for k, sy in _PY_W.items():
-        forms[k] = (11, sy)
-    out: dict[str, list[str]] = defaultdict(list)
-    for py, (cho, sy) in forms.items():
-        out[_py_hangul(cho, sy)].append(py)
-        # 영어식 표기: ong → 옹 (롱, 홍), eng → 엥 (펭), ui → 위 (휘), iu → 이우 (리우)
-        if py.endswith("ong") and not py.endswith("iong"):
-            out[_py_hangul(cho, sy[:-1] + [(8, 21)])].append(py)
-        if py.endswith("eng"):
-            out[_py_hangul(cho, sy[:-1] + [(5, 21)])].append(py)
-        if py.endswith("ui"):
-            out[_py_hangul(cho, [(16, 0)])].append(py)
-        if py.endswith("iu"):
-            out[_py_hangul(cho, [(20, 0), (13, 0)])].append(py)
-    return {h: list(dict.fromkeys(v)) for h, v in out.items()}
+        forms[k] = ("w", k[1:], 11, sy)
+    return forms
 
 
-PINYIN_MAP = _build_pinyin_map()
+def _py_variants(ini: str, fin: str, cho: int, sy: list[tuple[int, int]]) -> list[str]:
+    """병음 음절 하나의 한글 표기들 (공식 표기 먼저). 항만 기록은 병음을 영어식으로 읽은 표기가 많다
+    (Feng 펭, Heng 헹, Zhen 젠, Shen 센, Shandong 샨동, Yuan 유안, Xiu 시우, Zhou 조우)."""
+    finals = [sy]
+    if fin.endswith("ong") and fin != "iong":
+        finals.append(sy[:-1] + [(8, 21)])                      # 옹: 롱, 홍, 동
+    if fin in ("e", "en", "eng"):
+        finals.append(sy[:-1] + [(5, sy[-1][1])])               # 에·엔·엥: 헤, 젠, 펭
+    if fin == "ui":
+        finals += [[(16, 0)]]                                    # 휘
+    if fin == "iu":
+        finals += [[(20, 0), (13, 0)]]                           # 리우, 시우
+    if fin == "ou":
+        finals += [[(8, 0), (13, 0)]]                            # 조우, 쇼우
+    if fin == "ian":
+        finals += [[(20, 0), (0, 4)]]                            # 티안, 리안
+    if fin == "uan":
+        finals += [[(17, 0), (0, 4)]] if ini in ("j", "q", "x", "y") else [[(13, 0), (0, 4)]]  # 유안 / 후안
+    if fin == "uo":
+        finals += [[(13, 0), (8, 0)]]                            # 구오
+    if fin in ("ia", "iang", "iao"):
+        finals += [[(20, 0), (0, sy[0][1])] + sy[1:]]            # 시앙, 지아
+    chos = [cho] + ([12] if ini == "z" else []) + ([9] if ini == "s" else [])  # z → ㅈ, s → ㅅ
+    glide = {0: 2, 4: 6, 8: 12, 13: 17}                          # sh + ㅏㅓㅗㅜ → ㅑㅕㅛㅠ: 샨, 셴, 쇼우, 슈
+    out = [_py_hangul(c, f) for c in chos for f in finals]
+    if ini == "sh":
+        out += [_py_hangul(9, [(glide.get(f[0][0], f[0][0]), f[0][1])] + f[1:]) for f in finals]
+    return list(dict.fromkeys(out))
+
+
+def _build_pinyin_maps() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    back: dict[str, list[str]] = defaultdict(list)
+    forward: dict[str, list[str]] = {}
+    for py, (ini, fin, cho, sy) in _py_forms().items():
+        forward[py] = _py_variants(ini, fin, cho, sy)
+        for h in forward[py]:
+            back[h].append(py)
+    return {h: list(dict.fromkeys(v)) for h, v in back.items()}, forward
+
+
+PINYIN_MAP, PINYIN_FORWARD = _build_pinyin_maps()  # 한글 → 병음 음절들 / 병음 음절 → 한글 표기들
+
+# ---------------------------------------------------------------- 카탈로그명의 한글 표기와 한글끼리 비교 (v28)
+# 카탈로그 영문명마다 LLM으로 '항만 기록식 한글 표기'를 미리 만들어 두고(tools/translit_catalog.py),
+# 한글 쿼리와 자모 단위로 비교한다 (에버 얼라이언스 ↔ 에버 얼라이언스 / 에버 릴라이언스).
+_CHO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+_JUNG = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ"
+_JONG = " ㄱㄲㄳㄴㄵㄶㄷㄹㄺㄻㄼㄽㄾㄿㅀㅁㅂㅄㅅㅆㅇㅈㅊㅋㅌㅍㅎ"
+TOP_KHAN = 20
+
+
+def jamo_compact(name: str) -> str:
+    """한글 이름 → 자모열 (공백 제거, 끝의 '호'·'제N' 정리는 tokenize 와 같게). 초성 ㅇ 은 뺀다."""
+    out = []
+    for ch in "".join(tokenize(name)):
+        code = ord(ch) - 0xAC00
+        if 0 <= code < 11172:
+            c, j, t = code // 588, (code % 588) // 28, code % 28
+            out.append(("" if c == 11 else _CHO[c]) + _JUNG[j] + ("" if t == 0 else _JONG[t]))
+        else:
+            out.append(ch)
+    return "".join(out)
 TOP_PINYIN = 20
 
 
-def pinyin_token(tok: str, limit: int = 3) -> list[str]:
+def pinyin_token(tok: str, limit: int = 4) -> list[str]:
     """한글 토큰 하나 → 병음 읽기 후보 (음절 수가 적은 분해 우선). 읽을 수 없으면 []."""
     n = len(tok)
     best: list[list[tuple[int, str]]] = [[] for _ in range(n + 1)]  # (음절 수, 문자열)
@@ -708,7 +771,7 @@ def pinyin_token(tok: str, limit: int = 3) -> list[str]:
     for i in range(n):
         if not best[i]:
             continue
-        for L in (1, 2):
+        for L in (1, 2, 3):  # 시아오(xiao)처럼 영어식 표기는 3글자까지
             piece = tok[i : i + L]
             if len(piece) == L and piece in PINYIN_MAP:
                 cand = [(c + 1, s + py) for c, s in best[i] for py in PINYIN_MAP[piece]]
@@ -716,7 +779,7 @@ def pinyin_token(tok: str, limit: int = 3) -> list[str]:
     return [s.upper() for _, s in sorted(best[n])[:limit]] if best[n] else []
 
 
-def query_pinyin(toks: list[str], limit: int = 6) -> list[str]:
+def query_pinyin(toks: list[str], limit: int = 10) -> list[str]:
     """한글 쿼리 → 병음 읽기 compact 후보 (토큰별 순위 합이 작은 조합 우선). 한글 토큰이 하나도 안 읽히면 []."""
     combos, read = [(0, "")], False
     for t in toks:
@@ -830,6 +893,7 @@ FEATURE_NAMES = (
     "word_hit", "rel_word_hit",
     "s_llm", "s_llm1", "rel_llm", "rank_llm", "llm_exact",
     "s_pinyin", "rel_pinyin",
+    "s_khan", "rel_khan", "rank_khan",
 )
 TOP_LLM = 20  # LLM 영문 복원 결과(빔 전체 최고 유사도)로 뽑는 후보 수 (이름만 / 이름+톤수)
 
@@ -942,6 +1006,17 @@ def candidates_and_features(
                 np.maximum(m_py, process.cdist(forms, index.compact, scorer=fuzz.ratio, dtype=np.uint8, workers=-1), out=m_py)
             top_py = [_topk(m_py, TOP_PINYIN), _topk(m_py + bonus[py_rows], TOP_PINYIN)]
 
+        # 카탈로그명의 한글 표기 ↔ 한글 쿼리 (자모 단위 글자 유사도)
+        m_khan = None
+        top_khan: list[np.ndarray] = []
+        if index.cat_khan is not None and res.get("use_khan") and hangul_rows:
+            q_jamo = [jamo_compact(part[i]["raw"]) for i in hangul_rows]
+            m_khan = None
+            for slot in index.cat_khan:
+                sc = process.cdist(q_jamo, slot, scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
+                m_khan = sc if m_khan is None else np.maximum(m_khan, sc)
+            top_khan = [_topk(m_khan, TOP_KHAN), _topk(m_khan + bonus[hangul_rows], TOP_KHAN)]
+
         # 단어 단위 후보: 쿼리 단어(희귀할수록 가중)를 가진 선박. 단어 하나가 빠진 쿼리 대응
         word_scores: list[dict[int, float]] = []
         if res.get("word_index"):
@@ -963,6 +1038,8 @@ def candidates_and_features(
                     pool += list(tv[hangul_pos[i]])
                 for tl in top_llm:
                     pool += list(tl[hangul_pos[i]])
+                for tk in top_khan:
+                    pool += list(tk[hangul_pos[i]])
             if i in py_pos:
                 for tp in top_py:
                     pool += list(tp[py_pos[i]])
@@ -985,8 +1062,9 @@ def candidates_and_features(
                 llm_rows = (m_llm[j, cand], m_llm1[j, cand],
                             np.array([float(index.compact[c] in llm_forms[i]) for c in cand], dtype=np.float32))
             py_row = m_py[py_pos[i], cand] if i in py_pos else None
+            khan_row = m_khan[hangul_pos[i], cand] if m_khan is not None and i in hangul_pos else None
             blocks.append(_pair_features(q, cand, index, res, m_compact[i, cand], m_skel[i, cand], skel_t_row,
-                                         emb_rows, word_row, llm_rows, py_row))
+                                         emb_rows, word_row, llm_rows, py_row, khan_row))
     return cand_lists, np.vstack(blocks).astype(np.float32)
 
 
@@ -1003,7 +1081,7 @@ def _tonnage_bonus(part: list[dict], index: CatalogIndex) -> np.ndarray:
 
 
 def _pair_features(q, cand, index, res, s_compact, s_skel, s_skel_t, s_embs=None, s_word=None,
-                   s_llm=None, s_py=None) -> np.ndarray:
+                   s_llm=None, s_py=None, s_khan=None) -> np.ndarray:
     n = len(cand)
     c_clean = [index.clean[c] for c in cand]
     c_compact = [index.compact[c] for c in cand]
@@ -1104,6 +1182,10 @@ def _pair_features(q, cand, index, res, s_compact, s_skel, s_skel_t, s_embs=None
         cols += [best, first, best - best.max(), llm_rank, exact]
     s_py = np.zeros(n, dtype=np.float32) if s_py is None else np.asarray(s_py, dtype=np.float32)
     cols += [s_py, s_py - s_py.max()]
+    s_khan = np.zeros(n, dtype=np.float32) if s_khan is None else np.asarray(s_khan, dtype=np.float32)
+    khan_rank = np.empty(n, dtype=np.float32)
+    khan_rank[np.argsort(-s_khan, kind="mergesort")] = np.arange(n)
+    cols += [s_khan, s_khan - s_khan.max(), khan_rank]
     return np.column_stack(cols)
 
 

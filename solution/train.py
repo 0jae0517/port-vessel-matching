@@ -64,6 +64,7 @@ CROSS_INDEXES: dict | None = None  # 교차 학습 (attach_cross), v21
 USE_LLM = False  # LLM 영문 복원 후보·피처 (한글 쿼리), v22
 LLM_NAME = ""  # --llm: 추론에 쓸 models/<이름> (LoRA 병합 모델)
 USE_PINYIN = False  # --pinyin: 한글 → 중국어 병음 역변환 후보·피처, v24
+KHAN_FILE: Path | None = None  # --catalog-hangul: 카탈로그명 한글 표기표 (tools/translit_catalog.py), v28
 LLM_BEAMS = 4
 class _E5Prefix(dict):
     """e5 계열(파인튜닝 모델 e5-small-ft* 포함)은 'query: ' 접두어."""
@@ -101,7 +102,15 @@ def resources(train: pd.DataFrame, catalog: pd.DataFrame) -> dict:
     res["word_index"] = WORD_INDEX
     res["use_llm"] = USE_LLM
     res["use_pinyin"] = USE_PINYIN
+    res["use_khan"] = KHAN_FILE is not None
     return res
+
+
+def attach_khan(index: ml.CatalogIndex) -> None:
+    if KHAN_FILE is not None:
+        import json
+
+        index.attach_catalog_hangul(json.loads(KHAN_FILE.read_text(encoding="utf-8")))
 
 
 class LLMCache:
@@ -220,6 +229,7 @@ def attach_cross(names_by_half: dict[int, str], other: list[str],
             attach_embedding(idx, name)
         if llm_by_half:
             idx.attach_llm(LLMCache(llm_by_half[1 - h]))
+        attach_khan(idx)
         out[h] = idx
     return out
 
@@ -237,7 +247,7 @@ MONOTONE_UP = {
     "exact", "first_eq", "num_equal", "gt_exact", "flag_prob", "type_prob",
     "s_var_ratio", "s_var_jw", "s_var_partial", "s_learn_ratio", "s_learn_top1", "s_learn_jw",
     "s_vocab_ratio", "s_vocab_jw", "s_alpha_ratio", "s_emb", "s_emb2", "word_hit",
-    "s_llm", "s_llm1", "llm_exact", "s_pinyin",
+    "s_llm", "s_llm1", "llm_exact", "s_pinyin", "s_khan",
 }
 MONOTONE_DOWN = {"num_conflict", "gap_gross", "gap_intl", "gap_best", "num_q_only", "num_c_only"}
 USE_MONOTONE = True
@@ -427,6 +437,8 @@ def build_submission(train, catalog, index, out_dir: Path, use_callsign: bool, u
     for k, name in enumerate(EMB_NAMES):
         shutil.copytree(ROOT / "models" / name, out_dir / "model" / emb_dir_name(k),
                         ignore=shutil.ignore_patterns(".cache", "*.lock", "*.metadata", ".gitignore"))
+    if KHAN_FILE is not None:
+        shutil.copy(KHAN_FILE, out_dir / "model" / "catalog_hangul.json")
     if USE_LLM:
         shutil.copy(ROOT / "solution" / "llm_lib.py", out_dir / "model" / "llm_lib.py")
         shutil.copytree(ROOT / "models" / LLM_NAME, out_dir / "model" / "llm",
@@ -459,10 +471,12 @@ def main() -> None:
     parser.add_argument("--llm", help="LLM 영문 복원 모델 (models/<이름>, 한글 쿼리 후보·피처, v22)")
     parser.add_argument("--llm-cross", help="LLM 교차 학습 절반 모델 '절반0 모델,절반1 모델' (--cross 와 함께)")
     parser.add_argument("--pinyin", action="store_true", help="한글 → 중국어 병음 역변환 후보·피처 (v24)")
+    parser.add_argument("--catalog-hangul", type=Path, help="카탈로그명 한글 표기표 JSON (한글끼리 비교 후보·피처, v28)")
     args = parser.parse_args()
     global NO_DICT, OOF_TAG, USE_VOCAB, EMB_NAMES, EMB_ALL, AUGMENT, WORD_INDEX, AUG_EXTRA, CROSS_INDEXES
-    global USE_LLM, LLM_NAME, USE_PINYIN
+    global USE_LLM, LLM_NAME, USE_PINYIN, KHAN_FILE
     USE_PINYIN = args.pinyin
+    KHAN_FILE = args.catalog_hangul.resolve() if args.catalog_hangul else None
     NO_DICT, OOF_TAG, USE_VOCAB, EMB_ALL = args.no_dict, args.tag, args.vocab, args.emb_all
     AUGMENT, WORD_INDEX, AUG_EXTRA = args.augment, args.word, args.aug_extra
     EMB_NAMES = [n.strip() for n in (args.emb or "").split(",") if n.strip()]
@@ -482,6 +496,7 @@ def main() -> None:
         attach_embedding(index, name)
     if args.llm:
         index.attach_llm(LLMCache(LLM_NAME))
+    attach_khan(index)
     if args.cross:
         h0, h1 = [n.strip() for n in args.cross.split(",")]
         CROSS_INDEXES = attach_cross({0: h0, 1: h1}, EMB_NAMES[1:], llm_halves)
