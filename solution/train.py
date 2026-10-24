@@ -64,6 +64,8 @@ CROSS_INDEXES: dict | None = None  # 교차 학습 (attach_cross), v21
 USE_LLM = False  # LLM 영문 복원 후보·피처 (한글 쿼리), v22
 LLM_NAME = ""  # --llm: 추론에 쓸 models/<이름> (LoRA 병합 모델)
 USE_PINYIN = False  # --pinyin: 한글 → 중국어 병음 역변환 후보·피처, v24
+USE_ABBR = False  # --abbr: 약칭(뒤쪽 잘림·이니셜) 후보·피처 + 증강, v30
+SYNTH_TRAIN: pd.DataFrame | None = None  # --synth-train: 카탈로그 기반 합성 한글 학습 행 (tools/make_synth_train.py), v31
 KHAN_FILE: Path | None = None  # --catalog-hangul: 카탈로그명 한글 표기표 (tools/translit_catalog.py), v28
 LLM_BEAMS = 4
 class _E5Prefix(dict):
@@ -103,6 +105,7 @@ def resources(train: pd.DataFrame, catalog: pd.DataFrame) -> dict:
     res["use_llm"] = USE_LLM
     res["use_pinyin"] = USE_PINYIN
     res["use_khan"] = KHAN_FILE is not None
+    res["use_abbr"] = USE_ABBR
     return res
 
 
@@ -174,6 +177,9 @@ def training_names(train: pd.DataFrame) -> list[str]:
 
 
 def training_matrix(train: pd.DataFrame, catalog: pd.DataFrame, index: ml.CatalogIndex, inner: int = 5):
+    if SYNTH_TRAIN is not None:
+        # 카탈로그 한글 표기표로 만든 한글 학습 행 추가 (train에 없는 선박, train 정답 미사용, v31)
+        train = pd.concat([train, SYNTH_TRAIN[train.columns]], ignore_index=True)
     xs, ys, groups = [], [], []
     hits = 0
     splitter = GroupKFold(n_splits=inner)
@@ -185,6 +191,7 @@ def training_matrix(train: pd.DataFrame, catalog: pd.DataFrame, index: ml.Catalo
             import augment as aug_mod
 
             aug_mod.EXTRA_NOISE = AUG_EXTRA
+            aug_mod.ABBR_NOISE = USE_ABBR
             part = pd.concat([part, aug_mod.augment(part, AUGMENT)], ignore_index=True)
         # 교차 학습: 파인튜닝 임베딩은 그 선박을 학습하지 않은 절반 모델로 피처를 계산 (누수 방지)
         if CROSS_INDEXES:
@@ -247,7 +254,7 @@ MONOTONE_UP = {
     "exact", "first_eq", "num_equal", "gt_exact", "flag_prob", "type_prob",
     "s_var_ratio", "s_var_jw", "s_var_partial", "s_learn_ratio", "s_learn_top1", "s_learn_jw",
     "s_vocab_ratio", "s_vocab_jw", "s_alpha_ratio", "s_emb", "s_emb2", "word_hit",
-    "s_llm", "s_llm1", "llm_exact", "s_pinyin", "s_khan",
+    "s_llm", "s_llm1", "llm_exact", "s_pinyin", "s_khan", "s_prefix", "tok_prefix",
 }
 MONOTONE_DOWN = {"num_conflict", "gap_gross", "gap_intl", "gap_best", "num_q_only", "num_c_only"}
 USE_MONOTONE = True
@@ -471,11 +478,16 @@ def main() -> None:
     parser.add_argument("--llm", help="LLM 영문 복원 모델 (models/<이름>, 한글 쿼리 후보·피처, v22)")
     parser.add_argument("--llm-cross", help="LLM 교차 학습 절반 모델 '절반0 모델,절반1 모델' (--cross 와 함께)")
     parser.add_argument("--pinyin", action="store_true", help="한글 → 중국어 병음 역변환 후보·피처 (v24)")
+    parser.add_argument("--abbr", action="store_true", help="약칭(뒤쪽 잘림·이니셜) 후보·피처와 증강 (v30)")
     parser.add_argument("--catalog-hangul", type=Path, help="카탈로그명 한글 표기표 JSON (한글끼리 비교 후보·피처, v28)")
+    parser.add_argument("--synth-train", type=Path, help="카탈로그 기반 합성 한글 학습 행 CSV (LightGBM 학습에만 추가, v31)")
     args = parser.parse_args()
     global NO_DICT, OOF_TAG, USE_VOCAB, EMB_NAMES, EMB_ALL, AUGMENT, WORD_INDEX, AUG_EXTRA, CROSS_INDEXES
-    global USE_LLM, LLM_NAME, USE_PINYIN, KHAN_FILE
+    global USE_LLM, LLM_NAME, USE_PINYIN, KHAN_FILE, USE_ABBR, SYNTH_TRAIN
+    if args.synth_train:
+        SYNTH_TRAIN = pd.read_csv(args.synth_train, encoding="utf-8-sig")
     USE_PINYIN = args.pinyin
+    USE_ABBR = args.abbr
     KHAN_FILE = args.catalog_hangul.resolve() if args.catalog_hangul else None
     NO_DICT, OOF_TAG, USE_VOCAB, EMB_ALL = args.no_dict, args.tag, args.vocab, args.emb_all
     AUGMENT, WORD_INDEX, AUG_EXTRA = args.augment, args.word, args.aug_extra
@@ -488,7 +500,7 @@ def main() -> None:
         if args.llm_cross:
             h0, h1 = [n.strip() for n in args.llm_cross.split(",")]
             llm_halves = {0: h0, 1: h1}
-            warm_cross_llm(train, llm_halves)
+            warm_cross_llm(train if SYNTH_TRAIN is None else pd.concat([train, SYNTH_TRAIN[train.columns]]), llm_halves)
         else:
             LLMCache(LLM_NAME).warm(training_names(train))
     index = ml.CatalogIndex(catalog)

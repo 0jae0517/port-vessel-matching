@@ -49,10 +49,116 @@ SCENARIOS = {
 }
 
 
+# ---------------------------------------------------------------- 현실적 이름 변형 (--variants)
+# 대회 소개(01_overview)의 '약칭, 띄어쓰기·철자 변형, 일부 정보 누락'을 비한글 이름에 건다.
+# Public 진단: 새로 추가된 행의 정확도가 한글 0.81, 비한글 0.84 (기존 3,000건은 0.997) → 어떤 변형에 약한지 찾는다
+
+ROMAN = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII", 8: "VIII", 9: "IX", 10: "X", 11: "XI", 12: "XII"}
+
+
+def _latin(row) -> bool:
+    return isinstance(row.get("vessel_name"), str) and not HANGUL.search(row["vessel_name"])
+
+
+def _name_fn(f):
+    def fn(row, rng):
+        if not _latin(row):
+            return row
+        row = dict(row)
+        row["vessel_name"] = f(str(row["vessel_name"]), rng)
+        return row
+    return fn
+
+
+def _prefix(s, rng):
+    return rng.choice(["M/V ", "MV ", "MT ", "M.V. ", "M/T "]) + s
+
+
+def _no_space(s, rng):
+    return s.replace(" ", "")
+
+
+def _initial(s, rng):
+    w = s.split()
+    if len(w) < 2:
+        return s
+    k = rng.randrange(len(w) - 1)  # 마지막 단어(보통 고유 부분)는 남긴다
+    w[k] = w[k][0] + "."
+    return " ".join(w)
+
+
+def _truncate(s, rng):
+    keep = max(3, int(round(len(s) * rng.uniform(0.55, 0.8))))
+    return s[:keep].rstrip()
+
+
+def _number_format(s, rng):
+    toks = s.split()
+    out = []
+    for t in toks:
+        if t.isdigit() and int(t) in ROMAN:
+            out.append(rng.choice([ROMAN[int(t)], f"NO.{t}", f"NO. {t}"]))
+        elif t.upper() in {v: k for k, v in ROMAN.items()}:
+            out.append(str({v: k for k, v in ROMAN.items()}[t.upper()]))
+        elif t.upper().startswith("NO.") and t[3:].isdigit():
+            out.append(t[3:])
+        else:
+            out.append(t)
+    return " ".join(out)
+
+
+def _swap(s, rng):
+    w = s.split()
+    if len(w) < 2:
+        return s
+    i = rng.randrange(len(w) - 1)
+    w[i], w[i + 1] = w[i + 1], w[i]
+    return " ".join(w)
+
+
+def _drop_vowels(s, rng):
+    """약칭식 자음만 남기기 (OCEAN PIONEER → OCN PNR 처럼 한 단어)."""
+    w = s.split()
+    k = rng.randrange(len(w))
+    if len(w[k]) > 3:
+        w[k] = w[k][0] + "".join(c for c in w[k][1:] if c.upper() not in "AEIOU")
+    return " ".join(w)
+
+
+def _type_missing(row, rng):
+    row = dict(row)
+    row["vessel_type"] = None
+    return row
+
+
+def _name_missing(row, rng):
+    row = dict(row)
+    row["vessel_name"] = None
+    return row
+
+
+VARIANTS = {
+    "원본": None,
+    "접두어 (M/V, MT)": _name_fn(_prefix),
+    "띄어쓰기 제거": _name_fn(_no_space),
+    "앞 단어 이니셜": _name_fn(_initial),
+    "뒤쪽 잘림 (55~80%)": _name_fn(_truncate),
+    "번호 형식 변경": _name_fn(_number_format),
+    "단어 순서 바꿈": _name_fn(_swap),
+    "단어 하나 자음만": _name_fn(_drop_vowels),
+    "선종 결측": _type_missing,
+    "선박명 결측": _name_missing,
+    "편집+1 & 톤수 결측": combo(name_edits(1), ton_missing),
+}
+
+
 # ---------------------------------------------------------------- 실행
 
 def main() -> None:
-    configs = sys.argv[1:] or ["v11", "v14", "v15"]
+    global SCENARIOS
+    if "--variants" in sys.argv:
+        SCENARIOS = VARIANTS
+    configs = [a for a in sys.argv[1:] if not a.startswith("--")] or ["v11", "v14", "v15"]
     T.NO_DICT = True
     train, catalog = T.load()
     hangul = train["vessel_name"].map(ml.is_hangul).to_numpy(bool)
@@ -63,14 +169,14 @@ def main() -> None:
 
     noisy = {name: apply(va, fn) for name, fn in SCENARIOS.items()}
     ex = va[va["vessel_name"].map(ml.is_hangul)].head(1).index.tolist() + va.head(2).index.tolist()
-    for name in ("이름 편집 +2", "단어 하나 삭제"):
+    for name in [n for n in SCENARIOS if n != "원본"][:9]:
         print(f"  예시 [{name}]:", [f"{va.loc[i, 'vessel_name']} → {noisy[name].loc[i, 'vessel_name']}" for i in ex])
 
     # v22~: LLM 영문 복원 결과를 임베딩 모델을 올리기 전에 미리 계산 (GPU 메모리 8GB)
     # v22·v23·v24: Qwen 3B LoRA / v25·v26: kanana LoRA (fold 0 학습 선박으로만 학습)
     LLMS = {"qwen": ("qwen3b-lora0-light", {0: "qwen3b-lora0h0", 1: "qwen3b-lora0h1"}),
             "kanana": ("kanana-lora0-light", {0: "kanana-lora0h0", 1: "kanana-lora0h1"})}
-    llm_of = {"v22": "qwen", "v23": "qwen", "v24": "qwen", "v25": "kanana", "v26": "kanana", "v28": "kanana"}
+    llm_of = {"v22": "qwen", "v23": "qwen", "v24": "qwen", "v25": "kanana", "v26": "kanana", "v28": "kanana", "v30": "kanana"}
     for kind in dict.fromkeys(llm_of[c] for c in configs if c in llm_of):
         full, halves = LLMS[kind]
         T.AUGMENT = 1
@@ -89,7 +195,7 @@ def main() -> None:
             # v20: 파인튜닝 e5(fold 0 학습 선박으로만 학습한 e5-small-ft0) + LaBSE
             # v23: e5 파인튜닝에 단어 삭제 노이즈 강화 (--drop-word 0.3) → e5-small-ft0w
             names = (("e5-small-ft0w", "labse") if cfg == "v23" else
-                     ("e5-small-ft0", "labse") if cfg in ("v20", "v21", "v22", "v24", "v25", "v26", "v28")
+                     ("e5-small-ft0", "labse") if cfg in ("v20", "v21", "v22", "v24", "v25", "v26", "v28", "v30")
                      else ("e5-small", "labse"))
             if names not in emb_indexes:
                 emb_indexes[names] = ml.CatalogIndex(catalog)
@@ -98,7 +204,7 @@ def main() -> None:
             index = emb_indexes[names]
         # v14: 임베딩(영문 포함) / v15: 임베딩 한글 전용 / v16: v14 + 노이즈 증강 + 단어 단위 검색
         # v16a: v14 + 노이즈 증강만 / v16w: v14 + 단어 단위 검색만 / v20: v16 + 파인튜닝 e5
-        late = ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v28")
+        late = ("v20", "v21", "v22", "v23", "v24", "v25", "v26", "v28", "v30")
         T.EMB_ALL = cfg in ("v14", "v16", "v16a", "v16w", *late)
         T.AUGMENT = 1 if cfg in ("v16", "v16a", *late) else 0
         T.WORD_INDEX = cfg in ("v16", "v16w", *late)
@@ -107,9 +213,10 @@ def main() -> None:
         use_llm = cfg in llm_of
         llm_full, llm_halves = LLMS[llm_of[cfg]] if use_llm else (None, None)
         T.USE_LLM = use_llm
-        T.USE_PINYIN = cfg in ("v24", "v25", "v28")
+        T.USE_PINYIN = cfg in ("v24", "v25", "v28", "v30")
+        T.USE_ABBR = cfg == "v30"  # v30: v28 + 약칭(잘림·이니셜) 후보·피처·증강
         # v28: v25 + 카탈로그명 한글 표기표와 한글끼리 비교 (tools/translit_catalog.py)
-        T.KHAN_FILE = ROOT / "outputs" / "translit" / "kanana2b.json" if cfg == "v28" else None
+        T.KHAN_FILE = ROOT / "outputs" / "translit" / "kanana2b.json" if cfg in ("v28", "v30") else None
         if T.KHAN_FILE is not None and index.cat_khan is None:
             T.attach_khan(index)
         T.CROSS_INDEXES = None
@@ -140,8 +247,8 @@ def main() -> None:
     df = pd.DataFrame(results)
     out = ROOT / "outputs" / "cv"
     out.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out / f"stress_test_{'_'.join(configs)}.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(details).to_csv(out / f"stress_diag_{'_'.join(configs)}.csv", index=False, encoding="utf-8-sig")
+    df.to_csv(out / f"stress_test_{'_'.join(configs)}{'_variants' if SCENARIOS is VARIANTS else ''}.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(details).to_csv(out / f"stress_diag_{'_'.join(configs)}{'_variants' if SCENARIOS is VARIANTS else ''}.csv", index=False, encoding="utf-8-sig")
     for metric in ("weighted", "hangul", "non_hangul"):
         print(f"\n===== {metric} =====")
         print(df.pivot(index="시나리오", columns="설정", values=metric).reindex(list(SCENARIOS)).to_string())

@@ -7,7 +7,8 @@ if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 $files = @(
     "solution\match_lib.py", "solution\augment.py",
     "analysis\synth_hangul.py", "analysis\pinyin_hangul.py",
-    "tools\translit_catalog.py", "tools\download_models.py", "tools\runpod_translit.sh",
+    "tools\translit_catalog.py", "tools\download_models.py", "tools\runpod_translit.sh", "tools\runpod_translit8b.sh",
+    "outputs\translit\suspects.txt",
     "open\train.csv", "open\vessel_catalog.csv"
 )
 foreach ($f in $files) {
@@ -16,8 +17,10 @@ foreach ($f in $files) {
     Copy-Item (Join-Path $root $f) $dst
 }
 # 리눅스에서 실행할 셸 스크립트는 LF 줄바꿈으로
-$sh = Join-Path $stage "tools\runpod_translit.sh"
-[IO.File]::WriteAllText($sh, ([IO.File]::ReadAllText($sh) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
+foreach ($s in "tools\runpod_translit.sh", "tools\runpod_translit8b.sh") {
+    $sh = Join-Path $stage $s
+    [IO.File]::WriteAllText($sh, ([IO.File]::ReadAllText($sh) -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
+}
 $zip = Join-Path $root "outputs\runpod_bundle.zip"
 if (Test-Path $zip) { Remove-Item $zip }
 # 리눅스에서 풀 수 있게 / 경로로 압축 (PowerShell 5.1 Compress-Archive 는 \ 경로를 씀)

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import bisect
 from collections import Counter, defaultdict
 import re
 import unicodedata
@@ -518,6 +519,15 @@ class CatalogIndex:
         order = np.argsort(self.gt[valid], kind="mergesort")
         self.sorted_gt_idx = valid[order]
         self.sorted_gt = self.gt[self.sorted_gt_idx]
+        # 약칭(뒤쪽 잘림) 후보: compact 이름 사전순 정렬 → 접두어 범위를 이분 탐색
+        self.prefix_order = np.argsort(np.array(self.compact, dtype=object), kind="mergesort")
+        self.sorted_compact = [self.compact[i] for i in self.prefix_order]
+
+    def prefix_matches(self, q_compact: str) -> np.ndarray:
+        """compact 이름이 q_compact 로 시작하는 카탈로그 행 (TORMG → TORMGANGA, TORMGRACE)."""
+        lo = bisect.bisect_left(self.sorted_compact, q_compact)
+        hi = bisect.bisect_left(self.sorted_compact, q_compact + "￿")
+        return self.prefix_order[lo:hi]
 
     # ------------------------------------------------------------ 단어 단위 색인 (단어 하나가 빠진 쿼리 대응)
     def build_word_index(self) -> None:
@@ -794,8 +804,34 @@ def query_pinyin(toks: list[str], limit: int = 10) -> list[str]:
     return out[:limit] if read else []
 
 
+# 한글·영문이 아닌 문자(한자, 가나, 키릴, 그리스 문자, 악센트) → 로마자 (v32)
+# train에는 영문·한글 이름만 있지만 대회의 '비한글'은 한글이 아닌 모든 표기다.
+# 영문·한글만으로 된 이름은 그대로 돌려줘서 기존 예측과 완전히 같다.
+_FOREIGN_FIX = {"号": " NO ", "號": " NO ", "丸": " MARU "}
+
+
+def _keep_char(ch: str) -> bool:
+    return (ch.isascii() or not ch.isalpha() or "가" <= ch <= "힣"
+            or "㄰" <= ch <= "㆏" or "ᄀ" <= ch <= "ᇿ")
+
+
+def translit_foreign(name):
+    if not isinstance(name, str) or all(_keep_char(ch) for ch in name):
+        return name
+    out = []
+    for ch in unicodedata.normalize("NFKC", name):
+        if _keep_char(ch):
+            out.append(ch)
+        elif ch in _FOREIGN_FIX:
+            out.append(_FOREIGN_FIX[ch])
+        else:
+            t = unidecode(ch)
+            out.append(f" {t} " if "一" <= ch <= "鿿" else t)
+    return " ".join("".join(out).split())
+
+
 def prepare_query(row: dict, res: dict) -> dict:
-    name = row.get("vessel_name")
+    name = translit_foreign(row.get("vessel_name"))
     toks = tokenize(name)
     hangul = is_hangul(name)
     words = [t for t in toks if not t.isdigit()]
@@ -851,6 +887,7 @@ def prepare_query(row: dict, res: dict) -> dict:
     return {
         "hangul": hangul,
         "raw": name if isinstance(name, str) else "",
+        "synthetic": str(row.get("sample_id", "")).startswith("SYNTR"),  # 카탈로그 표기표로 만든 학습 행 (v31)
         "word_forms": query_word_forms(toks, res) if res.get("word_index") else [],
         "whole_hit": whole is not None,
         "dict_cov": covered / len(hangul_words) if hangul_words else 1.0,
@@ -894,7 +931,9 @@ FEATURE_NAMES = (
     "s_llm", "s_llm1", "rel_llm", "rank_llm", "llm_exact",
     "s_pinyin", "rel_pinyin",
     "s_khan", "rel_khan", "rank_khan",
+    "s_prefix", "tok_prefix", "rel_tok_prefix", "q_has_initial",
 )
+TOP_PREFIX = 30  # 약칭(잘림) 후보: 접두어가 같은 선박 중 톤수가 가까운 순 (v30)
 TOP_LLM = 20  # LLM 영문 복원 결과(빔 전체 최고 유사도)로 뽑는 후보 수 (이름만 / 이름+톤수)
 
 
@@ -1015,6 +1054,14 @@ def candidates_and_features(
             for slot in index.cat_khan:
                 sc = process.cdist(q_jamo, slot, scorer=fuzz.ratio, dtype=np.uint8, workers=-1)
                 m_khan = sc if m_khan is None else np.maximum(m_khan, sc)
+            if force is not None:
+                # 합성 학습 행(카탈로그 표기표 첫 표기로 만든 쿼리)은 정답 선박의 그 표기를 비교에서 뺀다
+                # → 쿼리와 같은 표기가 표에 있는 '너무 쉬운' 학습 예시가 되지 않게 (나머지 표기만으로 비교)
+                for j, i in enumerate(hangul_rows):
+                    if part[i].get("synthetic"):
+                        t = force[start + i]
+                        rest = [slot[t] for slot in index.cat_khan[1:] if slot[t] and slot[t] != index.cat_khan[0][t]]
+                        m_khan[j, t] = max((fuzz.ratio(q_jamo[j], x) for x in rest), default=0)
             top_khan = [_topk(m_khan, TOP_KHAN), _topk(m_khan + bonus[hangul_rows], TOP_KHAN)]
 
         # 단어 단위 후보: 쿼리 단어(희귀할수록 가중)를 가진 선박. 단어 하나가 빠진 쿼리 대응
@@ -1046,6 +1093,12 @@ def candidates_and_features(
             pool += index.nearest_gt(q["gross"], TOP_TONNAGE)
             if q["intl"] != q["gross"]:
                 pool += index.nearest_gt(q["intl"], TOP_TONNAGE)
+            if res.get("use_abbr") and len(q["compact"]) >= 3:
+                # 약칭(뒤쪽 잘림): 이름이 쿼리로 시작하는 선박 중 톤수가 가까운 순
+                pm = index.prefix_matches(q["compact"])
+                if len(pm):
+                    pm = pm[np.argsort(-bonus[i, pm], kind="mergesort")[:TOP_PREFIX]]
+                    pool += [int(c) for c in pm]
             if force is not None:
                 if hits is not None:
                     hits.append(force[start + i] in pool)
@@ -1186,7 +1239,40 @@ def _pair_features(q, cand, index, res, s_compact, s_skel, s_skel_t, s_embs=None
     khan_rank = np.empty(n, dtype=np.float32)
     khan_rank[np.argsort(-s_khan, kind="mergesort")] = np.arange(n)
     cols += [s_khan, s_khan - s_khan.max(), khan_rank]
+    if res.get("use_abbr"):
+        # 약칭 피처: 쿼리가 후보 이름의 앞부분인지(잘림), 쿼리 단어가 후보 단어의 앞부분·이니셜로 순서대로 맞는지
+        qc = q["compact"]
+        s_prefix = np.array([_common_prefix(qc, c) / max(len(qc), 1) for c in c_compact], dtype=np.float32)
+        q_tok = q["clean"].split()
+        tok_prefix = np.array([_token_prefix(q_tok, index.clean[c].split()) for c in cand], dtype=np.float32)
+        has_init = float(any(len(t) == 1 and t.isalpha() for t in q_tok))
+        cols += [s_prefix, tok_prefix, tok_prefix - tok_prefix.max(), np.full(n, has_init, dtype=np.float32)]
+    else:
+        cols += [np.zeros(n, dtype=np.float32)] * 4
     return np.column_stack(cols)
+
+
+def _common_prefix(a: str, b: str) -> int:
+    k = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        k += 1
+    return k
+
+
+def _token_prefix(q_tok: list[str], c_tok: list[str]) -> float:
+    """쿼리 단어가 후보 단어의 앞부분(이니셜 포함)으로 순서대로 맞는 비율 (G EXPRESS ↔ GARNET EXPRESS = 1.0)."""
+    if not q_tok:
+        return 0.0
+    j = m = 0
+    for t in q_tok:
+        while j < len(c_tok) and not c_tok[j].startswith(t):
+            j += 1
+        if j < len(c_tok):
+            m += 1
+            j += 1
+    return m / len(q_tok)
 
 
 # ---------------------------------------------------------------- 앙상블
@@ -1257,6 +1343,17 @@ def predict(
         local = scores[offset : offset + len(cand)]
         offset += len(cand)
         best = index.ids[cand[int(np.argmax(local))]]
+        rr = getattr(index, "reranker", None)
+        cfg = res.get("rerank")
+        if rr is not None and cfg and len(cand) > 1:
+            # LLM 재정렬 (v33): LightGBM 1·2위 점수 차가 gate 미만인 행만, 상위 K개 중 'LightGBM 점수 + w × LLM 로그확률' 최대
+            order = np.argsort(-local, kind="mergesort")[: cfg["k"]]
+            if local[order[0]] - local[order[1]] < cfg["gate"]:
+                infos = [{"vessel_name": index.catalog["vessel_name"].iat[c], "gross_tonnage": index.catalog["gross_tonnage"].iat[c],
+                          "flag_name": index.catalog["flag_name"].iat[c], "vessel_type": index.catalog["vessel_type"].iat[c]}
+                         for c in cand[order]]
+                lp = rr(row, infos)
+                best = index.ids[cand[order[int(np.argmax(local[order] + cfg["w"] * lp))]]]
         if use_name_lookup:
             best = lookup_by_name(row, res, index) or best
         if use_callsign:

@@ -122,6 +122,28 @@ def swap_words(row: dict, rng: random.Random) -> dict:
 
 
 EXTRA_NOISE = False  # True: 치환 · 띄어쓰기 · 단어 순서 노이즈도 섞는다 (v19)
+ABBR_NOISE = False  # True: 영문 이름에 약칭형 변형(뒤쪽 잘림, 앞 단어 이니셜)을 섞는다 (v30)
+
+
+def _latin_name(row: dict) -> bool:
+    s = row.get("vessel_name")
+    return isinstance(s, str) and bool(s.strip()) and not any("가" <= ch <= "힣" for ch in s)
+
+
+def truncate_name(row: dict, rng: random.Random) -> dict:
+    """약칭: 이름 뒤쪽을 잘라낸다 (TORM GANGA → TORM G, PAGANELLA → PAGAN)."""
+    s = str(row["vessel_name"])
+    keep = max(3, int(round(len(s) * rng.uniform(0.55, 0.8))))
+    return {**row, "vessel_name": s[:keep].rstrip()}
+
+
+def initial_name(row: dict, rng: random.Random) -> dict:
+    """약칭: 마지막이 아닌 단어 하나를 이니셜로 (GARNET EXPRESS → G. EXPRESS)."""
+    words = str(row["vessel_name"]).split()
+    if len(words) >= 2:
+        k = rng.randrange(len(words) - 1)
+        words[k] = words[k][0] + "."
+    return {**row, "vessel_name": " ".join(words)}
 
 
 def random_noise(row: dict, rng: random.Random) -> dict:
@@ -143,6 +165,12 @@ def random_noise(row: dict, rng: random.Random) -> dict:
         row = ton_noise(0.05, 0.20)(row, rng)
     if rng.random() < 0.15:
         row = flag_missing(row, rng)
+    if ABBR_NOISE and _latin_name(row):  # 기존 노이즈 뒤에 따로 뽑아서, 꺼져 있을 때 결과가 바뀌지 않게
+        r = rng.random()
+        if r < 0.10:
+            row = truncate_name(row, rng)
+        elif r < 0.20:
+            row = initial_name(row, rng)
     return row
 
 

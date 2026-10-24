@@ -18,6 +18,8 @@ MODELS = {
     "qwen3b": "Qwen/Qwen2.5-3B-Instruct",
     # 카탈로그 영문명 → 한글 표기 합성용 (한국어 특화, Apache 2.0). 로컬 데이터 생성에만 사용
     "kanana2b": "kakaocorp/kanana-1.5-2.1b-instruct-2505",
+    # 카탈로그 한글 표기표 보강용 (로컬·임대 GPU 전처리에만 사용, 제출물에는 들어가지 않음)
+    "kanana8b": "kakaocorp/kanana-1.5-8b-instruct-2505",
 }
 PATTERNS = ["config.json", "*.safetensors", "*.safetensors.index.json", "tokenizer*", "vocab.txt", "vocab.json",
             "merges.txt", "generation_config.json", "sentencepiece.bpe.model",

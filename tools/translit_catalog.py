@@ -109,6 +109,7 @@ def main() -> None:
     p.add_argument("--batch", type=int, default=12)
     p.add_argument("--names-from", help="stress_diag CSV: 그 행들의 상위 후보 이름만 계산 (빠른 확인용)")
     p.add_argument("--names", nargs="+", help="이 카탈로그 영문명만 계산")
+    p.add_argument("--names-file", help="한 줄에 하나씩 카탈로그 영문명 (예: outputs/translit/suspects.txt)")
     p.add_argument("--rule-only", action="store_true", help="병음 규칙 표기만 채우고 LLM 생성은 하지 않음 (GPU 불필요)")
     p.add_argument("--redo-llm", action="store_true", help="기존 LLM 표기(문자열 값)를 지우고 다시 계산 (프롬프트를 바꿨을 때)")
     p.add_argument("--beams", type=int, default=4, help="빔 후보 수 (소리 유사도로 고름)")
@@ -118,7 +119,9 @@ def main() -> None:
 
     train = pd.read_csv(ROOT / "open" / "train.csv", encoding="utf-8-sig")
     catalog = pd.read_csv(ROOT / "open" / "vessel_catalog.csv", encoding="utf-8-sig")
-    if args.names:
+    if args.names_file:
+        names = pd.Series([x for x in Path(args.names_file).read_text(encoding="utf-8").splitlines() if x.strip()])
+    elif args.names:
         names = pd.Series(args.names)
     elif args.names_from:
         d = pd.read_csv(args.names_from, encoding="utf-8-sig")
